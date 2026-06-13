@@ -4,12 +4,15 @@ import {
     BULLET_SPEED, BULLET_DAMAGE, FIRE_RATE_MS, PLAYER_RANGE, PLAYER_FOV, 
     PLAYER_FIRE_RATE_MS, PLAYER_BULLET_DAMAGE, XP_PER_KILL, XP_PER_LEVEL_COMPLETE,
     CREDITS_PER_KILL, CREDITS_PER_LEVEL_COMPLETE, LASER_DAMAGE_PER_FRAME, 
-    BARREL_DAMAGE, BARREL_EXPLOSION_RADIUS,
+    BARREL_DAMAGE, BARREL_EXPLOSION_RADIUS, BARREL_HP,
     POWERUP_MEDKIT_HEAL, POWERUP_SHIELD_AMOUNT, POWERUP_SPEED_DURATION, 
     POWERUP_SPEED_MULTIPLIER, POWERUP_STEALTH_DURATION
 } from '../constants';
 import { Player, Enemy, Wall, Point, Bullet, Particle, GameState, EnemyType, Skin, Decoration, Laser, Environment, Powerup } from '../types';
 import { generateLevel } from '../utils/aiGameMaster';
+import StoryOverlay from './StoryOverlay';
+import DeletionOverlay from './DeletionOverlay';
+import LevelResultsOverlay from './LevelResultsOverlay';
 
 // --- MATH UTILS ---
 function dist(x1: number, y1: number, x2: number, y2: number) { 
@@ -89,7 +92,10 @@ export default function Game() {
         enemiesRemaining: 0,
         totalEnemies: 0,
         status: 'menu',
-        difficultyMultiplier: 1.0
+        difficultyMultiplier: 1.0,
+        solsticeTimeProgress: 0.0,
+        activeBriefing: '',
+        hackedTuringQuotes: []
     });
     
     const [playerStats, setPlayerStats] = useState({
@@ -97,15 +103,67 @@ export default function Game() {
         xp: 0,
         level: 1,
         nextLevelXp: 1000,
-        credits: 0
+        credits: 0,
+        knowledge: 0
     });
+
+    const [unlockedLevels, setUnlockedLevels] = useState<number>(() => {
+        const saved = localStorage.getItem('ha_unlocked_levels');
+        return saved ? parseInt(saved, 10) : 1;
+    });
+
+    const [selectedGameLevel, setSelectedGameLevel] = useState<number>(() => {
+        const saved = localStorage.getItem('ha_selected_level');
+        return saved ? parseInt(saved, 10) : 1;
+    });
+
+    const [phaseRetries, setPhaseRetries] = useState<number>(0);
+
+    const [levelStars, setLevelStars] = useState<Record<number, number>>(() => {
+        const saved = localStorage.getItem('ha_level_stars');
+        return saved ? JSON.parse(saved) : {};
+    });
+
+    const [activeLevelResults, setActiveLevelResults] = useState<{
+        levelNumber: number;
+        stars: number;
+        knowledgePoints: number;
+        credits: number;
+        xp: number;
+        isNewUnlock?: boolean;
+    } | null>(null);
 
     const [shopSkinId, setShopSkinId] = useState<string>('default');
     const [tutorialStep, setTutorialStep] = useState(0);
+    const [showStory, setShowStory] = useState<boolean>(false);
+    const [focusMode, setFocusMode] = useState<boolean>(false);
+    const [isTutorialMode, setIsTutorialMode] = useState<boolean>(false);
+    const [tutorialPhase, setTutorialPhase] = useState<number>(0);
+    const tutorialPhaseRef = useRef<number>(0);
 
-    // --- MUTABLE REFS (GAME LOGIC) ---
+    const advanceTutorialLesson = (nextPhase: number) => {
+        tutorialPhaseRef.current = nextPhase;
+        setTutorialPhase(nextPhase);
+    };
+
+    // --- HUD COLLAPSE STATES ---
+    const [hudExpandedSolar, setHudExpandedSolar] = useState<boolean>(false);
+    const [hudExpandedComms, setHudExpandedComms] = useState<boolean>(true);
+    const [hudExpandedStatus, setHudExpandedStatus] = useState<boolean>(true);
+    const [hudExpandedAbilities, setHudExpandedAbilities] = useState<boolean>(true);
+
+    // --- SOLSTICE POWER & CHATTER STATES ---
+    const [scanActiveTimer, setScanActiveTimer] = useState<number>(0);
+    const [slowTimeActiveTimer, setSlowTimeActiveTimer] = useState<number>(0);
+    const [radioChatLog, setRadioChatLog] = useState<string[]>([]);
+    const [hackingTerminal, setHackingTerminal] = useState<{ active: boolean; decrypting: boolean; percentage: number; quote: string } | null>(null);
+    const [tutorialPowerupExplain, setTutorialPowerupExplain] = useState<{ type: 'medkit' | 'shield' | 'speed' | 'stealth'; title: string; description: string; uses: string } | null>(null);
+    const [postMissionSummary, setPostMissionSummary] = useState<string>('');
+    const [floatingAlerts, setFloatingAlerts] = useState<{ id: number; text: string; color: string; timer: number; isSmall?: boolean }[]>([]);
+
+    // --- DIRECT MUTABLE REFS (GAME LOGIC) ---
     const playerRef = useRef<Player>(JSON.parse(JSON.stringify(INITIAL_PLAYER)));
-    const enemiesRef = useRef<Enemy[]>([]);
+    const enemiesRef = useRef<any[]>([]); // Using any to support custom radioBub field on enemies
     const wallsRef = useRef<Wall[]>([]);
     const decorationsRef = useRef<Decoration[]>([]);
     const lasersRef = useRef<Laser[]>([]);
@@ -134,6 +192,7 @@ export default function Game() {
     const cols = Math.ceil(CANVAS_WIDTH / GRID_SIZE);
     const rows = Math.ceil(CANVAS_HEIGHT / GRID_SIZE);
     const requestRef = useRef<number>();
+    const solsticeProgressRef = useRef<number>(0.0);
 
     // --- INITIALIZATION ---
     useEffect(() => {
@@ -256,6 +315,7 @@ export default function Game() {
         const pDist = dist(source.x, source.y, playerRef.current.x, playerRef.current.y);
         if (pDist < BARREL_EXPLOSION_RADIUS) {
             let dmg = BARREL_DAMAGE * (1 - pDist/BARREL_EXPLOSION_RADIUS);
+            const shieldWasActive = playerRef.current.shield > 0;
             
             // Shield Absorption
             if (playerRef.current.shield > 0) {
@@ -269,7 +329,16 @@ export default function Game() {
             }
 
             playerRef.current.hp -= dmg;
-            setPlayerStats(prev => ({...prev, hp: Math.max(0, playerRef.current.hp)}));
+            if (dmg > 0 && !shieldWasActive) {
+                const lostKnowledge = Math.round(dmg * 2);
+                playerRef.current.knowledge = Math.max(0, playerRef.current.knowledge - lostKnowledge);
+                addFloatingMessage(`-${(lostKnowledge / 10).toFixed(1)}%`, '#f87171', true);
+            }
+            setPlayerStats(prev => ({
+                ...prev, 
+                hp: Math.max(0, playerRef.current.hp),
+                knowledge: playerRef.current.knowledge
+            }));
             if (playerRef.current.hp <= 0) {
                 playerRef.current.dead = true;
                 setGameState(prev => ({...prev, status: 'gameover'}));
@@ -370,7 +439,12 @@ export default function Game() {
 
     // --- GAME CONTROL FUNCTIONS ---
 
-    const startLevel = useCallback((level: number, diffMult: number) => {
+    const addFloatingMessage = (text: string, color: string, isSmall?: boolean) => {
+        const id = Math.random();
+        setFloatingAlerts(prev => [...prev, { id, text, color, timer: 120, isSmall }]);
+    };
+
+    const startLevel = useCallback((level: number, diffMult: number, preserveCycle = true) => {
         const config = generateLevel(level, diffMult);
         
         wallsRef.current = config.walls;
@@ -389,11 +463,25 @@ export default function Game() {
         playerRef.current.shield = 0;
         playerRef.current.activeEffects = { speed: 0, stealth: 0 };
         
+        if (!preserveCycle) {
+            solsticeProgressRef.current = 0.0;
+            playerRef.current.knowledge = 0;
+        }
+        
         bulletsRef.current = [];
         particlesRef.current = [];
         ambientParticlesRef.current = [];
         
+        // Reset active solstice abilities
+        setScanActiveTimer(0);
+        setSlowTimeActiveTimer(0);
+        setRadioChatLog([]);
+        setFloatingAlerts([]);
+        setHackingTerminal(null);
+        setPostMissionSummary('');
+
         initGrid();
+        setHudExpandedSolar(false);
         
         setGameState(prev => ({
             ...prev,
@@ -401,11 +489,90 @@ export default function Game() {
             enemiesRemaining: config.enemies.length,
             totalEnemies: config.enemies.length,
             status: 'playing',
-            difficultyMultiplier: diffMult
+            difficultyMultiplier: diffMult,
+            solsticeTimeProgress: solsticeProgressRef.current,
+            activeBriefing: 'ESTABLISHING SECURE HELIOS LINK...'
         }));
         
-        setPlayerStats(prev => ({...prev, hp: playerRef.current.maxHp}));
+        setPlayerStats(prev => ({
+            ...prev,
+            hp: playerRef.current.maxHp,
+            knowledge: playerRef.current.knowledge
+        }));
+
+        // Fetch dynamic brief
+        fetch('/api/gemini/briefing', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                levelNumber: level,
+                modifierName: config.environment.solsticeModifier,
+                currentPhase: config.environment.solsticePhase
+            })
+        })
+        .then(res => res.json())
+        .then(data => {
+            setGameState(prev => ({ ...prev, activeBriefing: data.text }));
+        })
+        .catch(() => {
+            // Stable backup brief if network/keys unavailable
+            const b = config.environment.solsticeModifier === 'Golden Dawn' ? 'Golden Dawn registered. Visibility starts at 100% but shifts. Harvest daylight shards to engage subroutines.' : 'Standard eclipse configuration loaded. Target elements are alert but blind. Steal cores quietly.';
+            setGameState(prev => ({ ...prev, activeBriefing: b }));
+        });
+
     }, [initGrid]);
+
+    const handleLevelWin = (totalKnowledge: number) => {
+        const pct = Math.min(100, Math.floor((totalKnowledge / 1000) * 100));
+        
+        // Determine achieved stars
+        let stars = 1;
+        if (pct >= 81) stars = 3;
+        else if (pct >= 66) stars = 2;
+
+        // Update level completion score
+        const prevHighScore = levelStars[selectedGameLevel] || 0;
+        const newStars = Math.max(prevHighScore, stars);
+        
+        const nextStarsMap = { ...levelStars, [selectedGameLevel]: newStars };
+        setLevelStars(nextStarsMap);
+        localStorage.setItem('ha_level_stars', JSON.stringify(nextStarsMap));
+
+        // Unlock next level in progression automatically if we win (at least 1 star)
+        let isNewUnlock = false;
+        let nextUnlocked = unlockedLevels;
+        if (selectedGameLevel === unlockedLevels) {
+            nextUnlocked = unlockedLevels + 1;
+            setUnlockedLevels(nextUnlocked);
+            localStorage.setItem('ha_unlocked_levels', nextUnlocked.toString());
+            isNewUnlock = true;
+        }
+
+        // Calculate payout rewards
+        const creditsPayout = 200 + stars * 100;
+        const xpPayout = 500 + stars * 250;
+
+        playerRef.current.credits += creditsPayout;
+        playerRef.current.xp += xpPayout;
+        
+        setPlayerStats(prev => ({
+            ...prev, 
+            credits: playerRef.current.credits, 
+            xp: playerRef.current.xp,
+            knowledge: totalKnowledge
+        }));
+
+        setActiveLevelResults({
+            levelNumber: selectedGameLevel,
+            stars,
+            knowledgePoints: totalKnowledge,
+            credits: creditsPayout,
+            xp: xpPayout,
+            isNewUnlock
+        });
+
+        setGameState(prev => ({ ...prev, status: 'paused' }));
+    };
 
     const nextLevel = () => {
         let diffMod = 0;
@@ -426,22 +593,151 @@ export default function Game() {
              if (newXp >= nextXp) {
                  newLevel++;
                  nextXp = Math.floor(nextXp * 1.5);
-             }
+              }
              
              // Update ref too
              playerRef.current.credits = newCredits;
              playerRef.current.xp = newXp;
              playerRef.current.level = newLevel;
 
-             return { ...prev, xp: newXp, level: newLevel, nextLevelXp: nextXp, credits: newCredits };
+             return { ...prev, xp: newXp, level: newLevel, nextLevelXp: nextXp, credits: newCredits, knowledge: playerRef.current.knowledge };
         });
 
-        startLevel(gameState.currentLevel + 1, newDiff);
+        startLevel(gameState.currentLevel + 1, newDiff, true);
+        setPhaseRetries(0);
+    };
+
+    const playSelectedLevel = (levelNum: number) => {
+        setSelectedGameLevel(levelNum);
+        localStorage.setItem('ha_selected_level', levelNum.toString());
+        setPhaseRetries(0);
+        
+        playerRef.current.knowledge = 0;
+        playerRef.current.hp = INITIAL_PLAYER.maxHp;
+        playerRef.current.shield = 0;
+        solsticeProgressRef.current = 0.0;
+        
+        setPlayerStats(prev => ({ 
+            ...prev, 
+            hp: INITIAL_PLAYER.maxHp,
+            knowledge: 0
+        }));
+        
+        setActiveLevelResults(null);
+        
+        const levelDiffMult = 1.0 + (levelNum - 1) * 0.08;
+        startLevel(1, levelDiffMult, false);
     };
 
     const startGame = () => {
-        setPlayerStats(prev => ({ ...prev, hp: INITIAL_PLAYER.maxHp }));
-        startLevel(1, 1.0);
+        setGameState(prev => ({ ...prev, status: 'levels' }));
+    };
+
+    const startTutorialLevel = () => {
+        setIsTutorialMode(true);
+        tutorialPhaseRef.current = 0;
+        setTutorialPhase(0);
+        
+        const config = {
+            environment: {
+                solsticePhase: 'dawn' as any,
+                solsticeModifier: 'Golden Dawn' as any,
+                temperature: 'normal' as any,
+                bgColor: '#1c140c',
+                gridColor: '#2b1f15',
+                overlayColor: 'rgba(230, 115, 0, 0.08)'
+            },
+            walls: [
+                { id: 990, x: CANVAS_WIDTH / 2 - 120, y: CANVAS_HEIGHT / 2, w: 100, h: GRID_SIZE, type: 'wall' as any },
+                { id: 991, x: CANVAS_WIDTH / 2 + 100, y: CANVAS_HEIGHT / 2, w: GRID_SIZE, h: 100, type: 'container' as any },
+                { id: 992, x: CANVAS_WIDTH / 2 + 30, y: CANVAS_HEIGHT / 2 - 150, w: GRID_SIZE, h: GRID_SIZE, type: 'barrel' as any, hp: BARREL_HP, maxHp: BARREL_HP },
+                { id: 993, x: CANVAS_WIDTH / 2 - 200, y: CANVAS_HEIGHT / 2 - 100, w: GRID_SIZE, h: GRID_SIZE, type: 'terminal' as any, hacked: false }
+            ],
+            decorations: [] as any[],
+            enemies: [
+                {
+                    id: 999,
+                    x: CANVAS_WIDTH / 2 + 30,
+                    y: CANVAS_HEIGHT / 2 - 110,
+                    angle: Math.PI,
+                    range: 155,
+                    fov: 0.8,
+                    alive: true,
+                    patrolPoints: [{ x: CANVAS_WIDTH / 2 + 30, y: CANVAS_HEIGHT / 2 - 110 }],
+                    currentPatrolIdx: 0,
+                    actualPath: [] as any[],
+                    speed: 0,
+                    waitTime: 9999,
+                    state: 'patrol' as any,
+                    lastShotTime: 0,
+                    type: 'soldier' as any,
+                    hp: 40,
+                    maxHp: 40,
+                    enraged: false,
+                    lastPathCalcTime: 0
+                }
+            ],
+            lasers: [] as any[],
+            powerups: [
+                { id: 995, x: CANVAS_WIDTH / 2 + 60, y: 0, type: 'medkit' as any, active: true, bobOffset: 0 },
+                { id: 996, x: CANVAS_WIDTH / 2 + 110, y: 0, type: 'shield' as any, active: true, bobOffset: 0 },
+                { id: 997, x: CANVAS_WIDTH / 2 + 160, y: 0, type: 'speed' as any, active: true, bobOffset: 0 },
+                { id: 998, x: CANVAS_WIDTH / 2 + 210, y: 0, type: 'stealth' as any, active: true, bobOffset: 0 }
+            ].map(p => ({ ...p, y: CANVAS_HEIGHT / 2 + 50 })), // Make sure coordinates are correctly placed
+            playerStart: { x: CANVAS_WIDTH / 2, y: CANVAS_HEIGHT - 120 }
+        };
+
+        wallsRef.current = config.walls;
+        decorationsRef.current = config.decorations;
+        enemiesRef.current = config.enemies;
+        lasersRef.current = config.lasers;
+        powerupsRef.current = config.powerups;
+        environmentRef.current = config.environment;
+        
+        playerRef.current.x = config.playerStart.x;
+        playerRef.current.y = config.playerStart.y;
+        playerRef.current.currentPath = [];
+        playerRef.current.dead = false;
+        playerRef.current.hp = playerRef.current.maxHp;
+        playerRef.current.shield = 0;
+        playerRef.current.activeEffects = { speed: 0, stealth: 0 };
+        playerRef.current.knowledge = 0;
+        playerRef.current.credits = 0;
+        playerRef.current.xp = 0;
+
+        solsticeProgressRef.current = 0.0;
+        bulletsRef.current = [];
+        particlesRef.current = [];
+        ambientParticlesRef.current = [];
+        
+        setScanActiveTimer(0);
+        setSlowTimeActiveTimer(0);
+        setRadioChatLog([]);
+        setFloatingAlerts([]);
+        setHackingTerminal(null);
+        setPostMissionSummary('');
+
+        initGrid();
+        setHudExpandedSolar(false);
+        
+        setGameState(prev => ({
+            ...prev,
+            currentLevel: 1,
+            enemiesRemaining: config.enemies.length,
+            totalEnemies: config.enemies.length,
+            status: 'playing',
+            difficultyMultiplier: 1.0,
+            solsticeTimeProgress: 0.0,
+            activeBriefing: 'WELCOME TO SOLSTICE TRAINING PROGRAM...'
+        }));
+        
+        setPlayerStats(prev => ({
+            ...prev,
+            hp: playerRef.current.maxHp,
+            xp: 0,
+            credits: 0,
+            knowledge: 0
+        }));
     };
 
     const startTutorial = () => {
@@ -451,11 +747,16 @@ export default function Game() {
 
     const finishTutorial = () => {
         localStorage.setItem('ha_tutorial_seen', 'true');
-        setGameState(prev => ({...prev, status: 'menu'}));
+        startTutorialLevel();
     };
 
     const retryLevel = () => {
-        startLevel(gameState.currentLevel, gameState.difficultyMultiplier);
+        if (phaseRetries < 3) {
+            setPhaseRetries(prev => prev + 1);
+            startLevel(gameState.currentLevel, gameState.difficultyMultiplier, false);
+        } else {
+            playSelectedLevel(selectedGameLevel);
+        }
     };
 
     const pauseGame = () => {
@@ -464,6 +765,7 @@ export default function Game() {
     };
 
     const quitGame = () => {
+        setIsTutorialMode(false);
         setGameState(prev => ({...prev, status: 'menu'}));
     };
 
@@ -471,6 +773,131 @@ export default function Game() {
         setShopSkinId(playerRef.current.selectedSkin);
         setGameState(prev => ({...prev, status: 'shop'}));
     }
+
+    // --- SOLSTICE ACTIVES ENGINE ---
+    const triggerAbility = (type: 'dash' | 'cloak' | 'scan' | 'slowTime') => {
+        const p = playerRef.current;
+        if (p.dead || gameState.status !== 'playing') return;
+
+        let cost = 0;
+        if (type === 'dash') cost = 120;
+        else if (type === 'cloak') cost = 250;
+        else if (type === 'scan') cost = 100;
+        else if (type === 'slowTime') cost = 350;
+
+        if (playerStats.xp < cost) {
+            addFloatingMessage("INSUFFICIENT DAYLIGHT FRAGMENTS", '#FF4444');
+            return;
+        }
+
+        // Deduct cost from player daylight remnants
+        p.xp -= cost;
+        setPlayerStats(prev => ({ ...prev, xp: p.xp }));
+
+        if (type === 'dash') {
+            const distVal = 85;
+            const targetX = p.x + Math.cos(p.angle) * distVal;
+            const targetY = p.y + Math.sin(p.angle) * distVal;
+            
+            // Wall-colliding safe coordinates
+            const boundX = Math.max(25, Math.min(CANVAS_WIDTH - 25, targetX));
+            const boundY = Math.max(25, Math.min(CANVAS_HEIGHT - 25, targetY));
+            
+            p.x = boundX;
+            p.y = boundY;
+            createParticles(p.x, p.y, '#ffd54f', 'spark', 20);
+            addFloatingMessage("DASH TRIGGERED", '#ffd54f');
+        } 
+        else if (type === 'cloak') {
+            p.activeEffects.stealth = 5000; // 5 seconds
+            createParticles(p.x, p.y, '#e040fb', 'heal', 20);
+            addFloatingMessage("CLOAK ENERGIZED (INVISIBLE)", '#e040fb');
+        } 
+        else if (type === 'scan') {
+            setScanActiveTimer(6000); // 6 seconds
+            createParticles(p.x, p.y, '#00e5ff', 'dust', 20);
+            addFloatingMessage("PERIMETER SOLAR SCANNING ACTIVE", '#00e5ff');
+        } 
+        else if (type === 'slowTime') {
+            setSlowTimeActiveTimer(6000); // 6 seconds
+            createParticles(p.x, p.y, '#ff4500', 'fire', 30);
+            addFloatingMessage("ZENITH SPEED OVERLAY CONNECTED", '#ff4500');
+        }
+    };
+
+    // Keyboard controls for Solstice abilities
+    useEffect(() => {
+        const handleKeyDown = (e: KeyboardEvent) => {
+            if (gameState.status !== 'playing') return;
+            if (e.key === '1') triggerAbility('dash');
+            if (e.key === '2') triggerAbility('cloak');
+            if (e.key === '3') triggerAbility('scan');
+            if (e.key === '4') triggerAbility('slowTime');
+        };
+        window.addEventListener('keydown', handleKeyDown);
+        return () => window.removeEventListener('keydown', handleKeyDown);
+    }, [gameState.status, playerStats.xp]);
+
+    // Adaptive post-mission appraisal debrief (Google AI Usage Category)
+    useEffect(() => {
+        if (gameState.status === 'victory') {
+            const levelNum = gameState.currentLevel;
+            const kills = gameState.totalEnemies;
+            const damageTaken = playerRef.current.maxHp - playerRef.current.hp;
+            const levelMod = environmentRef.current.solsticeModifier;
+
+            fetch('/api/gemini/debrief', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    levelNumber: levelNum,
+                    kills: kills,
+                    damageTaken: damageTaken,
+                    timeTakenSec: 45,
+                    modifierName: levelMod
+                })
+            })
+            .then(res => res.json())
+            .then(data => {
+                setPostMissionSummary(data.text);
+            })
+            .catch(() => {
+                setPostMissionSummary(`[OPERATION SUMMARY] Sector ${levelNum} secure. Primary Solar Cores harvested under "${levelMod}" constraints. Daylight reserves stabilized at optimal density. Safe passage cleared.`);
+            });
+        }
+    }, [gameState.status]);
+
+    // NPC Communications / Chatter logs (Turing & AI Usage Categories)
+    useEffect(() => {
+        if (gameState.status !== 'playing') return;
+        
+        const handleChatter = () => {
+            const aliveEnemies = enemiesRef.current.filter(e => e.alive);
+            if (aliveEnemies.length === 0) return;
+            
+            const candidate = aliveEnemies[Math.floor(Math.random() * aliveEnemies.length)];
+            const typeKey = candidate.type || 'soldier';
+
+            fetch('/api/gemini/chatter', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    enemyType: typeKey === 'scout' ? 'dawn_scout' : (typeKey === 'soldier' ? 'noon_sentinel' : (typeKey === 'sniper' ? 'sunseer' : 'eclipse_guardian')),
+                    state: candidate.state === 'attack' ? 'attack' : (candidate.state === 'move' ? 'alert' : 'patrol'),
+                    modifierName: environmentRef.current.solsticeModifier
+                })
+            })
+            .then(res => res.json())
+            .then(data => {
+                setRadioChatLog(prev => [data.text, ...prev].slice(0, 4));
+                candidate.radioBub = { text: data.text, timer: 150 }; // ~2.5 secs
+            })
+            .catch(() => {});
+        };
+
+        const chatterInterval = setInterval(handleChatter, 12000);
+        return () => clearInterval(chatterInterval);
+    }, [gameState.status]);
 
     const buyOrEquipSkin = (skin: Skin) => {
         const p = playerRef.current;
@@ -528,7 +955,7 @@ export default function Game() {
 
     // --- MAIN GAME LOOP ---
     const update = () => {
-        if (gameState.status !== 'playing') return;
+        if (gameState.status !== 'playing' || tutorialPowerupExplain) return;
 
         const player = playerRef.current;
         const enemies = enemiesRef.current;
@@ -542,6 +969,186 @@ export default function Game() {
         if (damageTraumaRef.current > 0) {
             damageTraumaRef.current = Math.max(0, damageTraumaRef.current - 0.05);
         }
+
+        // --- SOLSTICE CLOCK PROGRESSION ---
+        if (!isTutorialMode && !hackingTerminal?.active) {
+            const lastProgress = solsticeProgressRef.current;
+            const nextProgress = Math.min(1.0, lastProgress + (1 / 5700)); // ~95 seconds full cycle
+            solsticeProgressRef.current = nextProgress;
+            if (nextProgress !== lastProgress) {
+                // Determine active phase based on percentage
+                let phase: any = 'dawn';
+                let overlay = 'transparent';
+                if (nextProgress < 0.16) {
+                    phase = 'dawn';
+                    overlay = env.solsticeModifier === 'Golden Dawn' ? 'rgba(230, 115, 0, 0.12)' : 'rgba(230, 115, 0, 0.07)';
+                } else if (nextProgress < 0.33) {
+                    phase = 'morning';
+                    overlay = 'rgba(255, 255, 255, 0.02)';
+                } else if (nextProgress < 0.52) {
+                    phase = 'noon';
+                    overlay = 'rgba(255, 235, 59, 0.05)';
+                } else if (nextProgress < 0.68) {
+                    phase = 'afternoon';
+                    overlay = 'rgba(156, 39, 176, 0.12)';
+                } else if (nextProgress < 0.84) {
+                    phase = 'sunset';
+                    overlay = 'rgba(180, 20, 120, 0.22)';
+                } else {
+                    phase = 'night';
+                    overlay = env.solsticeModifier === 'Eclipse Event' ? 'rgba(13, 0, 32, 0.65)' : 'rgba(13, 0, 32, 0.52)';
+                }
+
+                env.solsticePhase = phase;
+                env.overlayColor = overlay;
+                
+                setGameState(prev => ({ ...prev, solsticeTimeProgress: nextProgress }));
+            }
+
+            // Check if solstice clock hit 100% (1.0) and evaluate knowledge ratio endings
+            if (solsticeProgressRef.current >= 1.0) {
+                const totalKnowledge = player.knowledge;
+                const pct = (totalKnowledge / 1000) * 100;
+
+                if (pct < 50) {
+                    setGameState(prev => ({ ...prev, status: 'deleted' }));
+                } else {
+                    handleLevelWin(totalKnowledge);
+                }
+                return;
+            }
+        }
+
+        // --- PLAYABLE TUTORIAL STEP PROGRESSION ---
+        if (isTutorialMode && gameState.status === 'playing') {
+            const currentPhase = tutorialPhaseRef.current;
+            // Lesson 1: Movement
+            if (currentPhase === 0) {
+                const distToMarker = dist(player.x, player.y, CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2 + 120);
+                if (distToMarker < 35) {
+                    addFloatingMessage("GOAL COMPLETED", '#fbbf24', true);
+                    advanceTutorialLesson(1);
+                }
+            }
+            // Lesson 2: Rotation
+            else if (currentPhase === 1) {
+                if (joystickRef.current.active) {
+                    addFloatingMessage("GOAL COMPLETED", '#fbbf24', true);
+                    advanceTutorialLesson(2);
+                }
+            }
+            // Lesson 3: Kill cleaner
+            else if (currentPhase === 2) {
+                const guideAlive = enemies.some(e => e.id === 999 && e.alive);
+                if (!guideAlive) {
+                    addFloatingMessage("GOAL COMPLETED", '#fbbf24', true);
+                    advanceTutorialLesson(3);
+                }
+            }
+            // Lesson 4: Collect knowledge box
+            else if (currentPhase === 3) {
+                const termHacked = wallsRef.current.find(w => w.id === 993)?.hacked;
+                if (termHacked) {
+                    addFloatingMessage("GOAL COMPLETED", '#fbbf24', true);
+                    // Give XP so they can activate Cloak in Lesson 5
+                    player.xp = Math.max(player.xp, 250);
+                    setPlayerStats(prev => ({ ...prev, xp: player.xp }));
+                    advanceTutorialLesson(4);
+                }
+            }
+            // Lesson 5: Hide from cleaners (using Cloak ability)
+            else if (currentPhase === 4) {
+                const isStealthActive = player.activeEffects.stealth > 0;
+                if (isStealthActive) {
+                    addFloatingMessage("GOAL COMPLETED", '#fbbf24', true);
+                    advanceTutorialLesson(5);
+                }
+            }
+            // Lesson 6: Collect powerups and use them (at least one collected)
+            else if (currentPhase === 5) {
+                const collectedAny = powerups.some(p => !p.active);
+                if (collectedAny) {
+                    addFloatingMessage("GOAL COMPLETED", '#fbbf24', true);
+                    advanceTutorialLesson(6);
+                }
+            }
+            // Lesson 7: Collect powerups and use (collect second or activate another ability)
+            else if (currentPhase === 6) {
+                const inactiveCount = powerups.filter(p => !p.active).length;
+                const isAbilityActive = player.activeEffects.speed > 0 || player.activeEffects.stealth > 0 || scanActiveTimer > 0 || slowTimeActiveTimer > 0;
+                if (inactiveCount >= 2 || isAbilityActive) {
+                    addFloatingMessage("GOAL COMPLETED", '#fbbf24', true);
+                    advanceTutorialLesson(7);
+                }
+            }
+            // Lesson 8: Play the game in all with no direction or instructions (Escape Portal)
+            else if (currentPhase === 7) {
+                const distToPortal = dist(player.x, player.y, CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2 - 50);
+                if (distToPortal < 35) {
+                    setIsTutorialMode(false);
+                    tutorialPhaseRef.current = 0;
+                    setTutorialPhase(0);
+                    addFloatingMessage("TRAINING COMPLETE!", '#10b981');
+                    setGameState(prev => ({ ...prev, status: 'menu' }));
+                }
+            }
+        }
+
+        // --- DECREMENT COOLDOWNS & DECAY ALERTS ---
+        if (scanActiveTimer > 0) setScanActiveTimer(t => Math.max(0, t - 16.6));
+        if (slowTimeActiveTimer > 0) setSlowTimeActiveTimer(t => Math.max(0, t - 16.6));
+        setFloatingAlerts(alerts => alerts.map(a => ({ ...a, timer: a.timer - 1 })).filter(a => a.timer > 0));
+
+        // --- ENCRYPTED TURING TERM HACK SENSE ---
+        wallsRef.current.forEach(w => {
+            if (w.type === 'terminal' && !w.hacked) {
+                const distance = dist(player.x, player.y, w.x + w.w/2, w.y + w.h/2);
+                if (distance < 55) { // within touch range
+                    w.hacked = true;
+                    w.hp = 0; // Marked as used
+                    createParticles(w.x + w.w/2, w.y + w.h/2, '#00ff55', 'buff', 25);
+                    
+                    // Gained Daylight fragments + Sunlight beads
+                    player.xp = player.xp + 350;
+                    player.credits = player.credits + 60;
+                    setPlayerStats(prev => ({ ...prev, xp: player.xp, credits: player.credits }));
+                    
+                    // Boot turing modal
+                    setHackingTerminal({
+                        active: true,
+                        decrypting: true,
+                        percentage: 25,
+                        quote: "Awaiting decrypted signal..."
+                    });
+                    
+                    addFloatingMessage("KNOWLEDGE BOX SECURED. DECRYPTING...", '#fbbf24');
+                    
+                    fetch('/api/gemini/turing')
+                    .then(res => res.json())
+                    .then(data => {
+                        setHackingTerminal(prev => (prev ? {
+                            ...prev,
+                            decrypting: false,
+                            percentage: 100,
+                            quote: data.text
+                        } : null));
+                        setGameState(old => ({
+                            ...old,
+                            hackedTuringQuotes: [...old.hackedTuringQuotes, data.text]
+                        }));
+                    })
+                    .catch(() => {
+                        const fallbackText = "Decrypted fragment: 'Can a machine feel the warmth of the sun, or do its circuits merely log the temperature?'";
+                        setHackingTerminal(prev => (prev ? {
+                            ...prev,
+                            decrypting: false,
+                            percentage: 100,
+                            quote: fallbackText
+                        } : null));
+                    });
+                }
+            }
+        });
 
         // 0. Update Buffs
         if (player.activeEffects.speed > 0) player.activeEffects.speed -= 16.6; // ~1 frame at 60fps
@@ -596,6 +1203,37 @@ export default function Game() {
             if (dist(player.x, player.y, p.x, p.y) < player.radius + 15) {
                 p.active = false;
                 createParticles(p.x, p.y, '#FFF', 'heal', 20);
+
+                if (isTutorialMode) {
+                    let title = "";
+                    let description = "";
+                    let uses = "";
+
+                    if (p.type === 'medkit') {
+                        title = "❤ SOLSTICE HEALTH ASSEMBLY (MEDKIT)";
+                        description = "Re-compiles cellular molecular links to instantly repair organic and mechanical frameworks.";
+                        uses = "Instantly heals and restores +50 HP to your critical structural health gauge.";
+                    } else if (p.type === 'shield') {
+                        title = "🛡 DAYLIGHT RADIATION DEFLECTOR (SHIELD)";
+                        description = "Generates a radiating solar kinetic barrier around you (+50 Shield).";
+                        uses = "Absorbs incoming guard bullet fire and hazardous lasers. CRITICAL TACTIC: While active, any damage absorbed will NOT reduce your Acquired Knowledge Points!";
+                    } else if (p.type === 'speed') {
+                        title = "⚡ HELIOS FLUX OVERDRIVE (SPEED)";
+                        description = "Doubles player movement velocity by supercharging drive synapses.";
+                        uses = "Accelerates standard movement and translocation speed, allowing you to easily outrun guards or bypass high-speed laser fields.";
+                    } else if (p.type === 'stealth') {
+                        title = "🔮 ECLIPSE COGNITIVE CLOAK (STEALTH)";
+                        description = "Bends daytime rays completely around your frame, granting ultimate cognitive invisibility.";
+                        uses = "Enemies cannot see, pursue, or attack you while active. Use this golden opportunity to sneak into sentinel territories untouched and execute silent barrel traps!";
+                    }
+
+                    setTutorialPowerupExplain({
+                        type: p.type,
+                        title,
+                        description,
+                        uses
+                    });
+                }
                 
                 // Effect
                 switch (p.type) {
@@ -621,14 +1259,23 @@ export default function Game() {
              if (laser.active) {
                  if (rectOverlap({x: player.x - player.radius, y: player.y - player.radius, w: player.radius*2, h: player.radius*2}, laser)) {
                     let dmg = LASER_DAMAGE_PER_FRAME;
+                    const shieldWasActive = player.shield > 0;
                     if (player.shield > 0) {
                         player.shield = Math.max(0, player.shield - dmg);
                         dmg = 0;
                     }
                     player.hp -= dmg;
+                    if (dmg > 0 && !shieldWasActive) {
+                        const lostKnowledge = dmg * 2;
+                        player.knowledge = Math.max(0, player.knowledge - lostKnowledge);
+                    }
                     damageTraumaRef.current = Math.max(damageTraumaRef.current, 0.15);
                      
-                    setPlayerStats(prev => ({...prev, hp: Math.max(0, player.hp)}));
+                    setPlayerStats(prev => ({
+                        ...prev, 
+                        hp: Math.max(0, player.hp),
+                        knowledge: player.knowledge
+                    }));
                     if (player.hp <= 0 && !player.dead) {
                         player.dead = true;
                         setGameState(prev => ({...prev, status: 'gameover'}));
@@ -757,11 +1404,11 @@ export default function Game() {
             let effectiveFov = en.fov;
             let effectiveRange = en.range;
             if (player.activeEffects.stealth > 0) {
-                effectiveFov *= 0.5;
-                effectiveRange *= 0.6;
+                effectiveFov = 0;
+                effectiveRange = 0;
             }
             
-            const canSeePlayer = (viewDiff < effectiveFov / 2 && pDist < effectiveRange) && !isLineBlocked(en.x, en.y, player.x, player.y);
+            const canSeePlayer = (player.activeEffects.stealth <= 0) && (viewDiff < effectiveFov / 2 && pDist < effectiveRange) && !isLineBlocked(en.x, en.y, player.x, player.y);
 
             if (canSeePlayer) {
                 en.state = 'attack';
@@ -817,9 +1464,11 @@ export default function Game() {
                     en.angle += angleDiff * 0.1; 
                     let d = dist(en.x, en.y, target.x, target.y);
                     if (Math.abs(angleDiff) < 1.5) {
-                        if (d > en.speed) {
-                            en.x += Math.cos(targetAngle) * en.speed;
-                            en.y += Math.sin(targetAngle) * en.speed;
+                        const slowFactor = slowTimeActiveTimer > 0 ? 0.5 : 1.0;
+                        const activeSpeed = en.speed * slowFactor;
+                        if (d > activeSpeed) {
+                            en.x += Math.cos(targetAngle) * activeSpeed;
+                            en.y += Math.sin(targetAngle) * activeSpeed;
                         } else {
                             en.actualPath.shift();
                             if(en.actualPath.length === 0 && !en.enraged) { 
@@ -836,8 +1485,9 @@ export default function Game() {
             let b = bullets[i];
             const prevX = b.x;
             const prevY = b.y;
-            b.x += b.vx;
-            b.y += b.vy;
+            const slowFactor = slowTimeActiveTimer > 0 ? 0.45 : 1.0;
+            b.x += b.vx * slowFactor;
+            b.y += b.vy * slowFactor;
             
             // Wall Collision
             let hitWall: Wall | null = null;
@@ -872,6 +1522,14 @@ export default function Game() {
                         createParticles(en.x, en.y, ENEMY_COLORS[en.type] || '#ff0000');
                         if (en.hp <= 0) {
                             en.alive = false;
+                            
+                            // Increase knowledge on kill, scaled by selectedGameLevel multiplier (10% reduction per level above 1)
+                            const mult = Math.max(0.1, 1 - (selectedGameLevel - 1) * 0.1);
+                            const killPoints = Math.round(50 * mult);
+                            const killPercent = 5 * mult;
+                            playerRef.current.knowledge = Math.min(1000, playerRef.current.knowledge + killPoints);
+                            addFloatingMessage(`+${killPercent % 1 === 0 ? killPercent : killPercent.toFixed(1)}%`, '#34d399', true);
+                            
                             setPlayerStats(prev => {
                                 const newXp = prev.xp + XP_PER_KILL;
                                 const newCredits = prev.credits + CREDITS_PER_KILL;
@@ -882,7 +1540,16 @@ export default function Game() {
                                     nextXp = Math.floor(nextXp * 1.5);
                                 }
                                 playerRef.current.credits = newCredits;
-                                return { ...prev, xp: newXp, level: newLevel, nextLevelXp: nextXp, credits: newCredits };
+                                playerRef.current.xp = newXp;
+                                playerRef.current.level = newLevel;
+                                return { 
+                                    ...prev, 
+                                    xp: newXp, 
+                                    level: newLevel, 
+                                    nextLevelXp: nextXp, 
+                                    credits: newCredits,
+                                    knowledge: playerRef.current.knowledge 
+                                };
                             });
                             setGameState(prev => ({...prev, enemiesRemaining: prev.enemiesRemaining - 1}));
                         }
@@ -893,6 +1560,7 @@ export default function Game() {
             } else {
                 if (dist(b.x, b.y, player.x, player.y) < player.radius + 5) {
                     let dmg = b.damage;
+                    const shieldWasActive = player.shield > 0;
                     
                     if (player.shield > 0) {
                         if (player.shield >= dmg) {
@@ -909,10 +1577,23 @@ export default function Game() {
                     const intensity = b.damage > 15 ? 0.8 : 0.4;
                     damageTraumaRef.current = Math.min(2.0, damageTraumaRef.current + intensity);
 
-                    if (dmg > 0) createParticles(player.x, player.y, '#FF0000'); 
+                    if (dmg > 0 && !shieldWasActive) {
+                        createParticles(player.x, player.y, '#FF0000');
+                        
+                        // Lose 0.2% per damage (2 points per unit of damage)
+                        const lostKnowledge = Math.round(dmg * 2);
+                        playerRef.current.knowledge = Math.max(0, playerRef.current.knowledge - lostKnowledge);
+                        addFloatingMessage(`-${(lostKnowledge / 10).toFixed(1)}%`, '#f87171', true);
+                    } else if (dmg > 0) {
+                        createParticles(player.x, player.y, '#FF0000');
+                    }
                     
                     bullets.splice(i, 1);
-                    setPlayerStats(prev => ({...prev, hp: Math.max(0, player.hp)}));
+                    setPlayerStats(prev => ({
+                        ...prev, 
+                        hp: Math.max(0, player.hp),
+                        knowledge: playerRef.current.knowledge 
+                    }));
                     if (player.hp <= 0) {
                         player.dead = true;
                         setGameState(prev => ({...prev, status: 'gameover'}));
@@ -1051,7 +1732,21 @@ export default function Game() {
         wallsRef.current.forEach(w => {
             const {x, y, w: width, h, type} = w;
             ctx.save();
-            if (type === 'container') {
+            if (type === 'terminal') {
+                // Drawing an elegant Encrypted Data Terminal
+                ctx.fillStyle = '#0f172a'; ctx.fillRect(x, y, width, h);
+                ctx.strokeStyle = w.hacked ? '#10b981' : '#3b82f6'; ctx.lineWidth = 3; ctx.strokeRect(x, y, width, h);
+                // Glowing terminal screen
+                ctx.fillStyle = w.hacked ? '#064e3b' : '#1e3a8a'; ctx.fillRect(x + 4, y + 4, width - 8, h - 8);
+                // Pulsing cybernetic core
+                const cycle = Date.now() / 250;
+                const glow = 0.5 + 0.5 * Math.sin(cycle);
+                ctx.fillStyle = w.hacked ? `rgba(16, 185, 129, ${0.4 + glow * 0.4})` : `rgba(59, 130, 246, ${0.4 + glow * 0.4})`;
+                ctx.fillRect(x + 8, y + 8, width - 16, h - 16);
+                // Monospace T symbol
+                ctx.fillStyle = '#ffffff'; ctx.font = 'bold 12px Courier';
+                ctx.fillText('⚡', x + 10, y + 18);
+            } else if (type === 'container') {
                 ctx.beginPath(); ctx.rect(x, y, width, h); ctx.clip();
                 ctx.fillStyle = '#37474f'; ctx.fillRect(x, y, width, h);
                 ctx.fillStyle = '#263238'; 
@@ -1077,19 +1772,28 @@ export default function Game() {
                 ctx.lineWidth = 2; ctx.strokeStyle = '#0d47a1'; ctx.stroke();
                 ctx.beginPath(); ctx.arc(cx, cy, r*0.7, 0, Math.PI*2); ctx.stroke(); 
             } else if (type === 'barrel') {
+                // Symmetrical Solar Core design with energetic yellow flare rings
                 const cx = x + width/2; const cy = y + h/2; const r = width/2;
                 const hpRatio = (w.hp || 1) / (w.maxHp || 1);
-                const redVal = Math.floor(211 * hpRatio); const otherVal = Math.floor(47 * hpRatio);
-                ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI*2); ctx.fillStyle = `rgb(${redVal}, ${otherVal}, ${otherVal})`; ctx.fill(); 
-                ctx.lineWidth = 2; ctx.strokeStyle = '#b71c1c'; ctx.stroke();
-                ctx.fillStyle = '#ffeb3b'; ctx.beginPath(); ctx.rect(x + 2, y + h/2 - 5, width-4, 10); ctx.fill();
-                ctx.fillStyle = 'black'; ctx.font = '10px Arial'; ctx.fillText('!', cx - 2, cy + 4);
-                if (hpRatio < 0.8) {
-                    ctx.strokeStyle = 'rgba(0,0,0,0.6)'; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(cx + 8, cy - 8);
-                    if (hpRatio < 0.5) { ctx.moveTo(cx, cy); ctx.lineTo(cx - 8, cy + 6); }
-                    if (hpRatio < 0.25) { ctx.moveTo(cx, cy); ctx.lineTo(cx + 6, cy + 8); }
-                    ctx.stroke();
-                }
+                const pulse = 1.0 + 0.05 * Math.sin(Date.now() / 150);
+                
+                // Draw solar aura
+                let radialGrad = ctx.createRadialGradient(cx, cy, r * 0.2, cx, cy, r * pulse);
+                radialGrad.addColorStop(0, '#fff59d');
+                radialGrad.addColorStop(0.3, '#ffb74d');
+                radialGrad.addColorStop(0.8, '#ff3d00');
+                radialGrad.addColorStop(1, 'rgba(255, 61, 0, 0)');
+                ctx.beginPath(); ctx.arc(cx, cy, r * pulse * 1.3, 0, Math.PI*2); ctx.fillStyle = radialGrad; ctx.fill();
+
+                // Core shell
+                ctx.beginPath(); ctx.arc(cx, cy, r * 0.75, 0, Math.PI*2); 
+                ctx.fillStyle = `rgba(${Math.floor(255 * hpRatio)}, ${Math.floor(100 * hpRatio)}, 30, 1)`; 
+                ctx.fill(); 
+                ctx.lineWidth = 3; ctx.strokeStyle = '#ff3d00'; ctx.stroke();
+                
+                // Solar core symbol
+                ctx.fillStyle = '#000000'; ctx.font = 'bold 9px monospace';
+                ctx.fillText('☼', cx - 4, cy + 3);
             } else if (type === 'treasure') {
                 ctx.fillStyle = '#fbc02d'; ctx.fillRect(x, y, width, h);
                 ctx.strokeStyle = '#f57f17'; ctx.lineWidth = 3; ctx.strokeRect(x,y,width,h);
@@ -1143,6 +1847,37 @@ export default function Game() {
             ctx.fillStyle = `rgba(0,0,0, ${1 - healthPct})`; 
             ctx.fillRect(en.x - radius, en.y - radius, radius * 2, (radius * 2) - fillHeight);
             ctx.restore();
+
+            // Render Radio Speech chatter bubble if present!
+            if (en.radioBub && en.radioBub.timer > 0) {
+                en.radioBub.timer--;
+                ctx.save();
+                ctx.fillStyle = 'rgba(15, 23, 42, 0.9)';
+                ctx.strokeStyle = '#f59e0b';
+                ctx.lineWidth = 1.5;
+                ctx.lineJoin = 'round';
+                
+                const text = en.radioBub.text;
+                ctx.font = '700 9px monospace';
+                const textWidth = ctx.measureText(text).width;
+                const bx = en.x - textWidth/2 - 6;
+                const by = en.y - radius - 28;
+                const bw = textWidth + 12;
+                const bh = 15;
+                
+                ctx.beginPath(); ctx.rect(bx, by, bw, bh); ctx.fill(); ctx.stroke();
+                
+                // pointer down
+                ctx.beginPath();
+                ctx.moveTo(en.x - 4, by + bh);
+                ctx.lineTo(en.x, by + bh + 4);
+                ctx.lineTo(en.x + 4, by + bh);
+                ctx.fillStyle = 'rgba(15, 23, 42, 0.9)'; ctx.fill();
+                
+                ctx.fillStyle = '#f59e0b';
+                ctx.fillText(text, en.x - textWidth/2, by + 10);
+                ctx.restore();
+            }
         });
 
         // Bullets
@@ -1151,6 +1886,42 @@ export default function Game() {
             ctx.beginPath(); ctx.arc(b.x, b.y, 4, 0, Math.PI*2); ctx.fill();
             ctx.shadowBlur = 5; ctx.shadowColor = b.isPlayerBullet ? 'orange' : 'white'; ctx.fill(); ctx.shadowBlur = 0;
         });
+
+        // Active Solstice Ability Radar scan & slowTime ripple overlays
+        if (scanActiveTimer > 0) {
+            ctx.save();
+            ctx.strokeStyle = 'rgba(0, 229, 255, 0.5)';
+            ctx.lineWidth = 3;
+            const scanRadius = ((6000 - scanActiveTimer) / 10) % 550;
+            ctx.beginPath();
+            ctx.arc(playerRef.current.x, playerRef.current.y, scanRadius, 0, Math.PI*2);
+            ctx.stroke();
+
+            // Render all enemies with high-alert pulse outlines through walls!
+            enemiesRef.current.forEach(en => {
+                if (!en.alive) return;
+                ctx.save();
+                ctx.strokeStyle = '#e040fb';
+                ctx.lineWidth = 2.5;
+                ctx.beginPath();
+                ctx.arc(en.x, en.y, (ENEMY_RADII[en.type] || 12) + 6, 0, Math.PI*2);
+                ctx.stroke();
+                ctx.restore();
+            });
+            ctx.restore();
+        }
+
+        if (slowTimeActiveTimer > 0) {
+            ctx.save();
+            ctx.fillStyle = 'rgba(10, 50, 200, 0.08)';
+            ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+            ctx.strokeStyle = 'rgba(0, 229, 255, 0.25)';
+            ctx.lineWidth = 3;
+            ctx.beginPath();
+            ctx.arc(playerRef.current.x, playerRef.current.y, (slowTimeActiveTimer * 1.5) % 350, 0, Math.PI*2);
+            ctx.stroke();
+            ctx.restore();
+        }
 
         // Player
         const p = playerRef.current;
@@ -1229,6 +2000,215 @@ export default function Game() {
             ctx.restore();
         });
 
+        // Draw interactive tutorial graphics if in tutorial mode
+        if (isTutorialMode) {
+            // Target walk-to circle for Phase 0
+            if (tutorialPhase === 0) {
+                const markerX = CANVAS_WIDTH / 2;
+                const markerY = CANVAS_HEIGHT / 2 + 120;
+                const cycle = Date.now() / 200;
+                const size = 18 + 5 * Math.sin(cycle);
+                
+                ctx.save();
+                ctx.strokeStyle = '#eab308';
+                ctx.lineWidth = 3;
+                ctx.beginPath();
+                ctx.arc(markerX, markerY, size, 0, Math.PI * 2);
+                ctx.stroke();
+                
+                ctx.fillStyle = 'rgba(234, 179, 8, 0.15)';
+                ctx.beginPath();
+                ctx.arc(markerX, markerY, size, 0, Math.PI * 2);
+                ctx.fill();
+                
+                ctx.fillStyle = '#eab308';
+                ctx.beginPath();
+                ctx.arc(markerX, markerY, 4, 0, Math.PI * 2);
+                ctx.fill();
+                
+                ctx.font = 'bold 9px monospace';
+                ctx.fillStyle = '#eab308';
+                ctx.textAlign = 'center';
+                ctx.fillText('WALK HERE', markerX, markerY - size - 8);
+                ctx.restore();
+            }
+            // Radiant escape portal for Phase 4
+            else if (tutorialPhase === 4) {
+                const portalX = CANVAS_WIDTH / 2;
+                const portalY = CANVAS_HEIGHT / 2 - 50;
+                const cycle = Date.now() / 300;
+                const pulse = 1.0 + 0.1 * Math.sin(cycle);
+                
+                ctx.save();
+                const radialGrad = ctx.createRadialGradient(portalX, portalY, 5, portalX, portalY, 40 * pulse);
+                radialGrad.addColorStop(0, '#e0f7fa');
+                radialGrad.addColorStop(0.3, '#00e5ff');
+                radialGrad.addColorStop(0.8, 'rgba(0, 229, 255, 0.18)');
+                radialGrad.addColorStop(1, 'rgba(0, 229, 255, 0)');
+                
+                ctx.beginPath();
+                ctx.arc(portalX, portalY, 40 * pulse, 0, Math.PI * 2);
+                ctx.fillStyle = radialGrad;
+                ctx.fill();
+                
+                ctx.strokeStyle = '#00ffff';
+                ctx.lineWidth = 3;
+                ctx.beginPath();
+                ctx.arc(portalX, portalY, 25 * pulse, 0, Math.PI * 2);
+                ctx.stroke();
+                
+                ctx.translate(portalX, portalY);
+                ctx.rotate(cycle);
+                ctx.strokeStyle = '#ffffff';
+                ctx.lineWidth = 1.5;
+                ctx.beginPath();
+                for (let i = 0; i < 4; i++) {
+                    ctx.moveTo(0, -22);
+                    ctx.lineTo(0, -28);
+                    ctx.rotate(Math.PI / 2);
+                }
+                ctx.stroke();
+                ctx.restore();
+                
+                ctx.fillStyle = '#00e5ff';
+                ctx.font = 'bold 10px monospace';
+                ctx.textAlign = 'center';
+                ctx.fillText('ESCAPE PORTAL', portalX, portalY - 45);
+            }
+        }
+
+        // --- TUTORIAL HIGHLIGHT SPOTLIGHTS & FLOATING ARROWS ---
+        if (isTutorialMode) {
+            ctx.save();
+            let tx = 0, ty = 0, tr = 0;
+            let drawHole = false;
+            let text = "";
+            let specialAbilityHighlight = false;
+            let specialAbilityLabel = "";
+            
+            if (tutorialPhase === 0) {
+                tx = CANVAS_WIDTH / 2;
+                ty = CANVAS_HEIGHT / 2 + 120;
+                tr = 50;
+                drawHole = true;
+                text = "TAP OR WALK HERE";
+            } else if (tutorialPhase === 1) {
+                tx = player.x;
+                ty = player.y;
+                tr = 45;
+                drawHole = true;
+                text = "DRAG / HOLD ON THE SCREEN TO ROTATE";
+            } else if (tutorialPhase === 2) {
+                // Shoot the guard/barrel
+                tx = CANVAS_WIDTH / 2 + 30;
+                ty = CANVAS_HEIGHT / 2 - 150;
+                tr = 55;
+                drawHole = true;
+                text = "SHOOT RED BARREL TO DESTROY SENTRY";
+            } else if (tutorialPhase === 3) {
+                tx = CANVAS_WIDTH / 2 - 200;
+                ty = CANVAS_HEIGHT / 2 - 100;
+                tr = 55;
+                drawHole = true;
+                text = "STAND CLOSE TO DECRYPT TERMINAL";
+            } else if (tutorialPhase === 4) {
+                specialAbilityHighlight = true;
+                specialAbilityLabel = "⚡ ACTIVATE CLOAK [2] IN CLOCK ABILITIES PANEL TO INVISIBLY HIDE ⚡";
+            } else if (tutorialPhase === 5) {
+                tx = CANVAS_WIDTH / 2 + 135;
+                ty = CANVAS_HEIGHT / 2 + 50;
+                tr = 100;
+                drawHole = true;
+                text = "COLLECT POWERUP CRATES ON THE GROUND";
+            } else if (tutorialPhase === 6) {
+                tx = CANVAS_WIDTH / 2 + 135;
+                ty = CANVAS_HEIGHT / 2 + 50;
+                tr = 100;
+                drawHole = true;
+                text = "EXPERIMENT WITH BUFFS AND SKILLS";
+            } else if (tutorialPhase === 7) {
+                tx = CANVAS_WIDTH / 2;
+                ty = CANVAS_HEIGHT / 2 - 50;
+                tr = 65;
+                drawHole = true;
+                text = "STEP INSIDE CYAN PORTAL FOR EXTRACT";
+            }
+
+            if (drawHole) {
+                // Drawing masking overlay with a clear cutout spotlight!
+                ctx.fillStyle = 'rgba(15, 23, 42, 0.72)'; // Deep space slate backdrop
+                ctx.beginPath();
+                ctx.rect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT); // Outer clockwise rectangle
+                ctx.arc(tx, ty, tr, 0, Math.PI * 2, true); // Inner counter-clockwise circle
+                ctx.fill();
+
+                // Draw golden glowing highlight around the spotlight cutout
+                ctx.strokeStyle = '#fbbf24';
+                ctx.lineWidth = 3.5;
+                ctx.beginPath();
+                ctx.arc(tx, ty, tr, 0, Math.PI * 2);
+                ctx.stroke();
+
+                // Draw secondary pulse ring around the cutout
+                const ringPulse = tr + 8 + 4 * Math.sin(Date.now() / 180);
+                ctx.strokeStyle = 'rgba(251, 191, 36, 0.45)';
+                ctx.lineWidth = 1.5;
+                ctx.beginPath();
+                ctx.arc(tx, ty, ringPulse, 0, Math.PI * 2);
+                ctx.stroke();
+
+                // Draw high-fidelity floating/bobbing arrow targeting the hole
+                ctx.restore();
+                ctx.save();
+                ctx.shadowColor = '#fbbf24';
+                ctx.shadowBlur = 12;
+                
+                const bob = Math.sin(Date.now() / 140) * 9;
+                const arrowY = ty - tr - 28 + bob;
+
+                ctx.fillStyle = '#fbbf24'; // Golden Yellow fill
+                ctx.strokeStyle = '#000000';
+                ctx.lineWidth = 2.5;
+                
+                // Draw arrow geometry pointing down
+                ctx.beginPath();
+                ctx.moveTo(tx, ty - tr - 8 + bob); // Arrow tip (bottom center pointer)
+                ctx.lineTo(tx - 12, ty - tr - 24 + bob); // Head left
+                ctx.lineTo(tx - 5, ty - tr - 24 + bob); // Shaft bottom left
+                ctx.lineTo(tx - 5, ty - tr - 44 + bob); // Shaft top left
+                ctx.lineTo(tx + 5, ty - tr - 44 + bob); // Shaft top right
+                ctx.lineTo(tx + 5, ty - tr - 24 + bob); // Shaft bottom right
+                ctx.lineTo(tx + 12, ty - tr - 24 + bob); // Head right
+                ctx.closePath();
+                ctx.fill();
+                ctx.stroke();
+
+                // Draw clear instruct text overlay centered on the arrow
+                ctx.restore();
+                ctx.save();
+                ctx.font = 'bold 11px Inter, system-ui, sans-serif';
+                ctx.textAlign = 'center';
+                ctx.fillStyle = '#ffffff';
+                ctx.shadowColor = '#000000';
+                ctx.shadowBlur = 8;
+                ctx.fillText(text, tx, ty - tr - 56 + bob);
+            } else if (specialAbilityHighlight) {
+                // Dim down entire screen to focus eye on the clock abilities array at bottom center
+                ctx.fillStyle = 'rgba(15, 23, 42, 0.65)';
+                ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+
+                // Draw floating instruction text at bottom center pointing down to skill row
+                ctx.font = 'bold 12px Inter, system-ui, sans-serif';
+                ctx.textAlign = 'center';
+                ctx.fillStyle = '#f59e0b';
+                ctx.shadowColor = '#000000';
+                ctx.shadowBlur = 8;
+                const bob = Math.sin(Date.now() / 140) * 5;
+                ctx.fillText(specialAbilityLabel, CANVAS_WIDTH / 2, CANVAS_HEIGHT - 65 + bob);
+            }
+            ctx.restore();
+        }
+
         if (env.overlayColor !== 'transparent') {
             ctx.fillStyle = env.overlayColor;
             ctx.fillRect(0,0, CANVAS_WIDTH, CANVAS_HEIGHT);
@@ -1248,6 +2228,61 @@ export default function Game() {
         const scaleY = CANVAS_HEIGHT / rect.height;
         let clickX = (e.clientX - rect.left) * scaleX;
         let clickY = (e.clientY - rect.top) * scaleY;
+
+        // Check if click was on or close to an active terminal (knowledge box)
+        let targetedTerminal = null;
+        for (let w of wallsRef.current) {
+            if (w.type === 'terminal' && !w.hacked) {
+                const cx = w.x + w.w / 2;
+                const cy = w.y + w.h / 2;
+                const distanceToTerminal = dist(clickX, clickY, cx, cy);
+                if (distanceToTerminal < GRID_SIZE * 1.5 || (clickX >= w.x - 8 && clickX <= w.x + w.w + 8 && clickY >= w.y - 8 && clickY <= w.y + w.h + 8)) {
+                    targetedTerminal = w;
+                    break;
+                }
+            }
+        }
+
+        if (targetedTerminal) {
+            const tx = targetedTerminal.x + targetedTerminal.w / 2;
+            const ty = targetedTerminal.y + targetedTerminal.h / 2;
+            const tc = Math.floor(tx / GRID_SIZE);
+            const tr = Math.floor(ty / GRID_SIZE);
+            
+            // Look for adjacent non-blocked tiles
+            const neighbors = [
+                { c: tc - 1, r: tr },
+                { c: tc + 1, r: tr },
+                { c: tc, r: tr - 1 },
+                { c: tc, r: tr + 1 },
+                { c: tc - 1, r: tr - 1 },
+                { c: tc + 1, r: tr - 1 },
+                { c: tc - 1, r: tr + 1 },
+                { c: tc + 1, r: tr + 1 }
+            ];
+            
+            // Sort neighbors by distance to player
+            const pxCol = Math.floor(playerRef.current.x / GRID_SIZE);
+            const pyRow = Math.floor(playerRef.current.y / GRID_SIZE);
+            neighbors.sort((a, b) => {
+                const distA = Math.hypot(a.c - pxCol, a.r - pyRow);
+                const distB = Math.hypot(b.c - pxCol, b.r - pyRow);
+                return distA - distB;
+            });
+            
+            for (let n of neighbors) {
+                if (!isBlocked(n.c, n.r)) {
+                    const destX = (n.c + 0.5) * GRID_SIZE;
+                    const destY = (n.r + 0.5) * GRID_SIZE;
+                    let newPath = findPath(playerRef.current.x, playerRef.current.y, destX, destY);
+                    if (newPath.length > 0) {
+                        playerRef.current.currentPath = newPath;
+                        return; // Successfully routed toward terminal
+                    }
+                }
+            }
+        }
+
         let newPath = findPath(playerRef.current.x, playerRef.current.y, clickX, clickY);
         if(newPath.length > 0) playerRef.current.currentPath = newPath;
     };
@@ -1272,152 +2307,489 @@ export default function Game() {
     const barContainer = "h-4 bg-black/50 border border-white/30 rounded-sm overflow-hidden";
 
     return (
-        <div className="relative w-full h-full bg-zinc-800 select-none">
+        <div className="relative w-full h-full bg-zinc-950 select-none overflow-hidden font-sans text-white">
             
             <canvas 
                 ref={canvasRef}
                 width={CANVAS_WIDTH}
                 height={CANVAS_HEIGHT}
                 onClick={handleInput}
-                className="cursor-crosshair bg-zinc-900 block"
+                className="cursor-crosshair bg-slate-950 block mx-auto shadow-2xl"
                 style={{ width: `${CANVAS_WIDTH}px`, height: `${CANVAS_HEIGHT}px` }}
             />
+
+            {/* --- FLOATING ALERTS INNER LAYER --- */}
+            <div className="absolute top-24 left-1/2 transform -translate-x-1/2 flex flex-col gap-1 pointer-events-none items-center z-50">
+                {floatingAlerts.map(alert => {
+                    if (alert.isSmall) {
+                        return (
+                            <div 
+                                key={alert.id} 
+                                className="text-[11px] font-extrabold tracking-wider transition-all duration-300 animate-bounce opacity-90 select-none"
+                                style={{ color: alert.color, textShadow: '1px 1px 2px rgba(0,0,0,0.95)' }}
+                            >
+                                {alert.text}
+                            </div>
+                        );
+                    }
+                    return (
+                        <div 
+                            key={alert.id} 
+                            className="px-4 py-1.5 bg-slate-900/90 border-l-2 text-xs font-black tracking-widest uppercase transition-all duration-300 animate-bounce"
+                            style={{ borderColor: alert.color, color: alert.color }}
+                        >
+                            {alert.text}
+                        </div>
+                    );
+                })}
+            </div>
 
             {/* --- IN-GAME HUD --- */}
             {gameState.status === 'playing' || gameState.status === 'paused' ? (
                 <>
-                <div className={uiContainerClass}>
-                    {/* Top Header */}
-                    <div className="flex justify-between items-start z-10">
-                        {/* Target Counter */}
-                        <div className={`bg-red-600 text-white px-6 py-2 border-l-4 border-white ${slantClass} shadow-lg shadow-red-900/50`}>
-                            <div className="transform skew-x-12">
-                                <h2 className="text-2xl font-black italic tracking-tighter">TARGETS</h2>
-                                <p className="text-xl font-bold">{gameState.enemiesRemaining} <span className="text-sm opacity-70">/ {gameState.totalEnemies}</span></p>
+                {/* Special playable tutorial directives HUD banner */}
+                {isTutorialMode && (
+                    <div id="tutorial-phase-objective-banner" className="absolute top-[155px] left-1/2 transform -translate-x-1/2 w-full max-w-xl bg-slate-950/20 border border-amber-500/12 p-3 rounded shadow-[0_0_15px_rgba(234,179,8,0.10)] text-center backdrop-blur-md z-45 select-none animate-pulse pointer-events-auto">
+                         <span className="text-amber-400 text-[10px] font-mono tracking-widest block font-black uppercase text-center w-full">☼ TUTORIAL ACTIVE ☼</span>
+                         <p className="text-xs sm:text-sm font-bold text-white mt-1 text-center w-full">
+                             {tutorialPhase === 0 && "LESSON 1/8: Move the player by tapping or clicking on the floor to walk to the glowing yellow circle."}
+                             {tutorialPhase === 1 && "LESSON 2/8: Aim/Rotate the player. Drag and hold on the screen with the virtual joystick, or tap nearby, to rotate."}
+                             {tutorialPhase === 2 && "LESSON 3/8: Shoot and eliminate the Sentry Cleaner guard. TIP: Shoot the RED BARREL to cause a massive explosion!"}
+                             {tutorialPhase === 3 && "LESSON 4/8: Approach the yellow Terminal box on the left, stand close to decrypt standard knowledge data."}
+                             {tutorialPhase === 4 && "LESSON 5/8: A hostile patrol is searching! Tap CLOAK [2] under Clock Abilities below to grant absolute invisibility."}
+                             {tutorialPhase === 5 && "LESSON 6/8: Locate and collect any of the glowing supply crates (🩹 Medkit, 🛡️ Shield, ⚡ Speed, 👥 Stealth) on the floor."}
+                             {tutorialPhase === 6 && "LESSON 7/8: Collect another crate or activate any other remaining ability ([1] Dash, [3] Radar, [4] Warp) to test combined subroutines."}
+                             {tutorialPhase === 7 && "LESSON 8/8 (FINAL): Step inside the glowing CYAN radiant escape portal at the center to complete your training!"}
+                         </p>
+                    </div>
+                )}
+                {/* Solstice Solar Progress Tracker Meter */}
+                {!focusMode && (
+                    <div className="absolute top-2 left-1/2 transform -translate-x-1/2 w-full max-w-sm px-4 pointer-events-none z-20">
+                        {!hudExpandedSolar ? (
+                            /* COLLAPSED VIEW: A tiny translucent, elegant badge that is compact, minimal and pointer-events-auto only for the button */
+                            <div className="bg-slate-950/20 border border-slate-900/35 rounded-md px-3 py-1 backdrop-blur-md shadow-lg pointer-events-auto flex items-center justify-between text-[10px] text-slate-300 gap-4 mt-1 transition-all duration-300">
+                                <span className="font-bold tracking-widest flex items-center gap-1.5 min-w-0 truncate">
+                                    <span className="text-yellow-400">☼</span> SOLSTICE DAY: {Math.floor(gameState.solsticeTimeProgress * 100)}% ({environmentRef.current.solsticePhase?.toUpperCase() || 'DAWN'})
+                                </span>
+                                <button
+                                    onClick={() => setHudExpandedSolar(true)}
+                                    className="text-[8px] hover:text-white hover:bg-slate-800 text-yellow-400 font-black uppercase tracking-widest bg-slate-900 border border-slate-850 px-2 py-0.5 rounded transition shrink-0"
+                                >
+                                    Expand
+                                </button>
                             </div>
-                        </div>
-                        {/* Level Indicator */}
-                        <div className={`bg-yellow-500 text-black px-4 py-1 border-r-4 border-white ${slantClass} shadow-lg`}>
-                            <div className="transform skew-x-12 text-right">
-                                <p className="font-black text-lg">MISSION {gameState.currentLevel}</p>
-                                <p className="text-xs font-bold uppercase opacity-80">Credits: ${playerStats.credits}</p>
-                                <p className="text-[10px] font-bold uppercase opacity-60">
-                                    {environmentRef.current.temperature.toUpperCase()} | {environmentRef.current.timeOfDay.toUpperCase()}
+                        ) : (
+                            /* EXPANDED VIEW: Detailed solar progression meter */
+                            <div className="bg-slate-950/35 border border-slate-900/40 rounded p-3 backdrop-blur-md shadow-2xl pointer-events-auto flex flex-col relative transition-all duration-300">
+                                {/* Close toggle button */}
+                                <button 
+                                    onClick={() => setHudExpandedSolar(false)}
+                                    className="absolute top-2 right-2 text-slate-500 hover:text-white font-extrabold text-[8px] uppercase tracking-wider bg-slate-900 border border-slate-850 px-1.5 py-0.5 rounded transition"
+                                >
+                                    Hide ✕
+                                </button>
+                                <div className="flex justify-between items-center text-[8.5px] font-black tracking-wider text-slate-400 mb-2 mt-2">
+                                    <span className={gameState.solsticeTimeProgress < 0.16 ? "text-orange-400 font-black scale-105" : ""}>🌅 DAWN</span>
+                                    <span className={(gameState.solsticeTimeProgress >= 0.16 && gameState.solsticeTimeProgress < 0.33) ? "text-amber-350 font-black scale-105" : ""}>☀️ MORN</span>
+                                    <span className={(gameState.solsticeTimeProgress >= 0.33 && gameState.solsticeTimeProgress < 0.52) ? "text-yellow-400 font-black scale-105" : ""}>🌞 NOON</span>
+                                    <span className={(gameState.solsticeTimeProgress >= 0.52 && gameState.solsticeTimeProgress < 0.68) ? "text-purple-400 font-black" : ""}>🌆 AFT</span>
+                                    <span className={(gameState.solsticeTimeProgress >= 0.68 && gameState.solsticeTimeProgress < 0.84) ? "text-pink-400 font-black scale-105" : ""}>🌇 SET</span>
+                                    <span className={gameState.solsticeTimeProgress >= 0.84 ? "text-indigo-400 font-black scale-105" : ""}>🌑 NIGHT</span>
+                                </div>
+                                {/* Meter Line Bar */}
+                                <div className="h-1.5 bg-slate-900 border border-slate-850 rounded-full relative overflow-visible mt-0.5">
+                                    {/* Sliding Sun Cursor */}
+                                    <div 
+                                        className="absolute top-1/2 -translate-y-1/2 w-4 h-4 rounded-full bg-gradient-to-r from-yellow-400 to-orange-500 shadow-[0_0_8px_rgba(250,204,21,0.6)] flex items-center justify-center text-[9px] font-black text-black transition-all duration-300"
+                                        style={{ left: `calc(${gameState.solsticeTimeProgress * 100}% - 8px)` }}
+                                    >
+                                        ☼
+                                    </div>
+                                </div>
+                                <div className="flex justify-between items-center mt-2 text-[8px] font-bold text-slate-400">
+                                    <div>MODIFIER: <span className="text-yellow-500 font-black uppercase">{environmentRef.current.solsticeModifier}</span></div>
+                                    <div className="text-right uppercase">SOLSTICE DAY PROGRESS: <span className="text-white font-black">{Math.floor(gameState.solsticeTimeProgress * 100)}%</span></div>
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                )}
+
+                <div className={uiContainerClass}>
+                    {/* Top Header details - Moved up (mt-2) and made transparent + fully click-through (pointer-events-none) */}
+                    <div className="flex justify-between items-start z-10 w-full mt-1.5 pointer-events-none">
+                        {/* Target Counter */}
+                        {!focusMode ? (
+                            <div className="bg-slate-950/45 border border-slate-900/30 text-white px-3 py-1.5 border-l-2 border-yellow-500 shadow-md backdrop-blur-sm flex flex-col transition-all">
+                                <h2 className="text-[7.5px] font-black uppercase tracking-widest text-slate-400">SENTINELS ELIMINATED</h2>
+                                <p className="text-base font-black italic mt-0.5 leading-none">
+                                    {gameState.totalEnemies - gameState.enemiesRemaining} <span className="text-xs font-normal text-slate-500">/ {gameState.totalEnemies}</span>
                                 </p>
                             </div>
-                        </div>
-                    </div>
-
-                    {/* Bottom Status */}
-                    <div className="flex justify-between items-end z-10 w-full gap-4">
-                        {/* HP & XP */}
-                        <div className="flex-1 max-w-[200px] space-y-2">
-                            {/* HP & Shield */}
-                            <div className="relative">
-                                <div className="flex justify-between">
-                                    <p className="text-xs font-bold text-green-400 mb-0.5 ml-1 italic">VITALITY</p>
-                                    {playerRef.current.shield > 0 && <span className="text-xs font-bold text-cyan-400 animate-pulse">SHIELD ACTIVE</span>}
+                        ) : (
+                            <div />
+                        )}
+                        
+                        {/* Right Side: Life and Acquired Knowledge Bars Panel */}
+                        <div className="bg-slate-950/25 border border-slate-900/15 p-2.5 rounded shadow-lg backdrop-blur-md flex flex-col gap-2 w-52 text-right pointer-events-auto">
+                            {/* Life Bar (formerly Vitality Capacitor) */}
+                            <div className="relative text-left">
+                                <div className="flex justify-between text-[8px] font-black tracking-widest text-emerald-400 mb-1 leading-none">
+                                    <span className="uppercase">LIFE</span>
+                                    <span>{Math.ceil(playerStats.hp)}%</span>
                                 </div>
-                                <div className={barContainer}>
-                                    <div className="h-full bg-gradient-to-r from-green-600 to-green-400 transition-all duration-300" 
-                                         style={{width: `${(playerStats.hp / playerRef.current.maxHp) * 100}%`}} />
-                                    {/* Shield Overlay Bar */}
+                                <div className="h-2 bg-black/25 border border-white/10 rounded overflow-hidden relative">
+                                    <div 
+                                        className="h-full bg-gradient-to-r from-green-600 to-emerald-400 transition-all duration-300" 
+                                        style={{ width: `${Math.min(100, (playerStats.hp / playerRef.current.maxHp) * 100)}%` }} 
+                                    />
                                     {playerRef.current.shield > 0 && (
-                                        <div className="absolute top-0 left-0 h-full bg-cyan-400/50 border-r-2 border-cyan-200 transition-all duration-300"
-                                            style={{width: `${Math.min(100, playerRef.current.shield)}%`}} />
+                                        <div 
+                                            className="absolute top-0 left-0 h-full bg-cyan-400/50 border-r border-cyan-200 transition-all duration-300"
+                                            style={{ width: `${Math.min(100, playerRef.current.shield)}%` }} 
+                                        />
                                     )}
-                                </div>
-                                <span className="absolute right-1 top-4 text-[10px] text-white/80">{Math.ceil(playerStats.hp)}</span>
-                            </div>
-                            {/* XP */}
-                            <div className="relative">
-                                <div className="flex justify-between text-xs font-bold text-blue-400 mb-0.5 ml-1 italic">
-                                    <span>OPERATIVE RANK {playerStats.level}</span>
-                                </div>
-                                <div className={`${barContainer} h-2 border-blue-500/30`}>
-                                    <div className="h-full bg-gradient-to-r from-blue-600 to-cyan-400 transition-all duration-500" 
-                                         style={{width: `${(playerStats.xp / playerStats.nextLevelXp) * 100}%`}} />
                                 </div>
                             </div>
                             
-                            {/* Active Effects Display */}
-                            <div className="flex gap-2 min-h-[20px]">
-                                {playerRef.current.activeEffects.speed > 0 && (
-                                    <span className="text-[10px] font-bold bg-yellow-500/80 text-black px-1 rounded">SPD</span>
-                                )}
-                                {playerRef.current.activeEffects.stealth > 0 && (
-                                    <span className="text-[10px] font-bold bg-purple-500/80 text-white px-1 rounded">STL</span>
-                                )}
-                            </div>
+                            {/* Acquired Knowledge Bar */}
+                            {!focusMode && (
+                                <div className="relative text-left border-t border-slate-900/30 pt-1.5 animate-[fadeIn_0.3s_ease]">
+                                    <div className="flex justify-between text-[8px] font-black tracking-widest text-amber-400 mb-1 leading-none">
+                                        <span className="uppercase">ACQUIRED KNOWLEDGE</span>
+                                        <span>{Math.floor((playerStats.knowledge / 1000) * 100)}%</span>
+                                    </div>
+                                    <div className="h-2 bg-black/25 border border-amber-500/15 rounded overflow-hidden">
+                                        <div 
+                                            className="h-full bg-gradient-to-r from-amber-500 via-yellow-400 to-teal-400 transition-all duration-300" 
+                                            style={{ width: `${Math.min(100, (playerStats.knowledge / 1000) * 100)}%` }} 
+                                        />
+                                    </div>
+                                </div>
+                            )}
                         </div>
-                        
-                        {/* Pause Button */}
-                        <button onClick={pauseGame} className={`pointer-events-auto bg-white/10 hover:bg-white/20 p-2 rounded border border-white/20 backdrop-blur-sm transition`}>
-                            <div className="space-x-1 flex">
-                                <div className="w-2 h-6 bg-white"></div>
-                                <div className="w-2 h-6 bg-white"></div>
+                    </div>
+
+                    {/* NPC Ticker Feed on Left margin */}
+                    {!focusMode && radioChatLog.length > 0 && (
+                        <div className="absolute left-4 top-28 max-w-[190px] z-20 transition-all duration-300">
+                            {!hudExpandedComms ? (
+                                <button 
+                                    onClick={() => setHudExpandedComms(true)}
+                                    className="bg-slate-950/60 hover:bg-slate-900 border border-slate-900/50 rounded px-2.5 py-1 text-[8px] font-black hover:text-amber-400 transition text-slate-300 flex items-center gap-1 shadow-md pointer-events-auto uppercase tracking-widest"
+                                >
+                                    📡 COMMS Ticker ({radioChatLog.length})
+                                </button>
+                            ) : (
+                                <div className="bg-slate-950/50 border border-slate-900 rounded p-2 backdrop-blur-sm pointer-events-auto flex flex-col gap-1 shadow-md relative min-w-[140px]">
+                                    <div className="flex justify-between items-center border-b border-slate-900 pb-1 mb-1">
+                                        <span className="text-[8px] font-black text-amber-500 tracking-wider">▲ INTERCEPTED COMMS</span>
+                                        <button 
+                                            onClick={() => setHudExpandedComms(false)}
+                                            className="text-[9px] text-slate-500 hover:text-slate-200 transition px-1 font-extrabold"
+                                            title="Minimize Comms"
+                                        >
+                                            ✕
+                                        </button>
+                                    </div>
+                                    <div className="space-y-1 flex flex-col max-h-[110px] overflow-y-auto scrollbar-thin">
+                                        {radioChatLog.map((log, index) => (
+                                            <p key={index} className="text-[8px] font-mono leading-tight text-slate-300 border-l border-slate-800 pl-1 break-words">
+                                                &gt; {log}
+                                            </p>
+                                        ))}
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+                    )}
+
+                    {/* Bottom Status panel */}
+                    <div className="flex justify-between items-end z-10 w-full gap-4 mt-auto">
+                        {/* Left Side: HP, Knowledge Acquired, and Active effects replaced with Bottom Left Phase Box */}
+                        {!focusMode ? (
+                            <div className="flex flex-col gap-1.5 pointer-events-auto z-10 transition-all duration-300">
+                                {/* Active Buff status flags */}
+                                <div className="flex flex-wrap gap-1 min-h-[12px]">
+                                    {playerRef.current.activeEffects.speed > 0 && (
+                                        <span className="text-[7px] font-black bg-yellow-500/90 text-black px-1 rounded uppercase tracking-wider animate-pulse">TURBO ACCEL</span>
+                                    )}
+                                    {playerRef.current.activeEffects.stealth > 0 && (
+                                        <span className="text-[7px] font-black bg-purple-600 text-white px-1 rounded uppercase tracking-wider animate-pulse">CLOAK COGNITIVE</span>
+                                    )}
+                                    {scanActiveTimer > 0 && (
+                                        <span className="text-[7px] font-black bg-cyan-500 text-black px-1 rounded uppercase tracking-wider animate-pulse">RADAR TRACE</span>
+                                    )}
+                                    {slowTimeActiveTimer > 0 && (
+                                        <span className="text-[7px] font-black bg-red-500 text-white px-1 rounded uppercase tracking-wider animate-pulse">ZENITH OVERLAY</span>
+                                    )}
+                                </div>
+                                
+                                {/* Phase Box */}
+                                <div id="phase-box-panel" className="bg-slate-950/25 border border-slate-900/20 border-l-2 border-cyan-400/55 text-left px-3 py-2 shadow-lg backdrop-blur-sm flex flex-col w-36">
+                                    <h2 className="text-[7.5px] font-black uppercase tracking-widest text-slate-400">HELIOS STAGE</h2>
+                                    <div className="flex justify-between items-center mt-0.5">
+                                        <p className="text-sm font-black italic leading-none text-white">PHASE {gameState.currentLevel}</p>
+                                        <span className="text-[7.5px] font-black bg-cyan-950/80 border border-cyan-500/25 text-cyan-400 px-1 rounded uppercase tracking-wider font-mono">LVL {selectedGameLevel}</span>
+                                    </div>
+                                    <p className="text-[8.5px] font-bold text-slate-400 uppercase mt-1 tracking-wider leading-none">BEADS: ${playerStats.credits}</p>
+                                    <p className="text-[8.5px] font-bold text-yellow-500 uppercase mt-0.5 tracking-wider leading-none">FRAGS: {playerStats.xp} FG</p>
+                                </div>
                             </div>
-                        </button>
+                        ) : (
+                            <div className="w-10" />
+                        )}
+
+                        {/* Center: Tactile Subroutines Active Ability Deck */}
+                        {!focusMode ? (
+                            <div className="pointer-events-auto z-10 transition-all duration-300">
+                                {!hudExpandedAbilities ? (
+                                    <button
+                                        onClick={() => setHudExpandedAbilities(true)}
+                                        className="bg-slate-950/20 border border-slate-900/30 hover:bg-slate-900/50 p-2.5 rounded backdrop-blur-sm font-black text-[8px] tracking-widest hover:text-yellow-400 transition uppercase shadow-lg text-center whitespace-nowrap"
+                                    >
+                                        ⚡ CLOCK ABILITIES (1-4)
+                                    </button>
+                                ) : (
+                                    <div className="flex gap-2 bg-slate-950/15 p-2 rounded border border-slate-900/30 shadow-xl relative backdrop-blur-sm transition-all duration-300">
+                                        {/* Close btn on ability deck */}
+                                        <button
+                                            onClick={() => setHudExpandedAbilities(false)}
+                                            className="absolute -top-6 right-0 text-slate-500 hover:text-slate-200 transition font-extrabold text-[8px] uppercase tracking-wider bg-slate-950/40 border border-slate-900/30 px-1.5 py-0.5 rounded"
+                                        >
+                                            Hide Skills ✕
+                                        </button>
+                                        
+                                        {/* Subroutine Card: Dash */}
+                                        <button 
+                                            onClick={() => triggerAbility('dash')} 
+                                            className={`flex flex-col items-center justify-between w-13 h-13 p-1 rounded transition border text-center ${playerStats.xp >= 120 ? 'bg-slate-900/55 border-yellow-400/80 hover:bg-slate-800' : 'bg-slate-950/10 border-slate-900/40 text-slate-600 cursor-not-allowed'}`}
+                                            title="Dash Subroutine (Cost: 120, Hotkey: 1)"
+                                        >
+                                            <span className="text-[7px] font-black uppercase text-yellow-500 tracking-wider leading-none">[1] DASH</span>
+                                            <span className="text-[11px] leading-tight mt-0.5">⚡</span>
+                                            <span className="text-[7.5px] font-mono tracking-tighter mt-0.5">120 FG</span>
+                                        </button>
+                                        {/* Subroutine Card: Cloak */}
+                                        <button 
+                                            onClick={() => triggerAbility('cloak')} 
+                                            className={`flex flex-col items-center justify-between w-13 h-13 p-1 rounded transition border text-center ${playerStats.xp >= 250 ? 'bg-slate-900/55 border-purple-500/80 hover:bg-slate-800' : 'bg-slate-950/10 border-slate-900/40 text-slate-600 cursor-not-allowed'}`}
+                                            title="Cloak Invisible Subroutine (Cost: 250, Hotkey: 2)"
+                                        >
+                                            <span className="text-[7px] font-black uppercase text-purple-400 tracking-wider leading-none">[2] CLOAK</span>
+                                            <span className="text-[11px] leading-tight mt-0.5">🛸</span>
+                                            <span className="text-[7.5px] font-mono tracking-tighter mt-0.5">250 FG</span>
+                                        </button>
+                                        {/* Subroutine Card: Radar Scan */}
+                                        <button 
+                                            onClick={() => triggerAbility('scan')} 
+                                            className={`flex flex-col items-center justify-between w-13 h-13 p-1 rounded transition border text-center ${playerStats.xp >= 100 ? 'bg-slate-900/55 border-cyan-400/80 hover:bg-slate-800' : 'bg-slate-950/10 border-slate-900/40 text-slate-600 cursor-not-allowed'}`}
+                                            title="Radar Scan Subroutine (Cost: 100, Hotkey: 3)"
+                                        >
+                                            <span className="text-[7px] font-black uppercase text-cyan-400 tracking-wider leading-none">[3] RADAR</span>
+                                            <span className="text-[11px] leading-tight mt-0.5">📡</span>
+                                            <span className="text-[7.5px] font-mono tracking-tighter mt-0.5">100 FG</span>
+                                        </button>
+                                        {/* Subroutine Card: Time Warp */}
+                                        <button 
+                                            onClick={() => triggerAbility('slowTime')} 
+                                            className={`flex flex-col items-center justify-between w-13 h-13 p-1 rounded transition border text-center ${playerStats.xp >= 350 ? 'bg-slate-900/55 border-orange-500/80 hover:bg-slate-800' : 'bg-slate-950/10 border-slate-900/40 text-slate-600 cursor-not-allowed'}`}
+                                            title="Time Slowing Zenith Subroutine (Cost: 350, Hotkey: 4)"
+                                        >
+                                            <span className="text-[7px] font-black uppercase text-orange-400 tracking-wider leading-none">[4] WARP</span>
+                                            <span className="text-[11px] leading-tight mt-0.5">⏳</span>
+                                            <span className="text-[7.5px] font-mono tracking-tighter mt-0.5">350 FG</span>
+                                        </button>
+                                    </div>
+                                )}
+                            </div>
+                        ) : (
+                            <div className="w-1" />
+                        )}
+ 
+                        {/* Right Side: Pause & Focus mode controls */}
+                        <div className="flex gap-1.5 items-center pointer-events-auto z-20">
+                            {/* Focus Mode button */}
+                            <button 
+                                id="focus-mode-toggle"
+                                onClick={() => setFocusMode(!focusMode)} 
+                                className={`px-2.5 py-1.5 rounded border backdrop-blur-sm transition-all duration-200 shadow-md text-[9px] font-black uppercase tracking-wider font-mono ${
+                                    focusMode 
+                                        ? 'bg-yellow-500 text-slate-950 border-yellow-400 shadow-[0_0_8px_rgba(234,179,8,0.35)] animate-pulse' 
+                                        : 'bg-slate-950/60 text-slate-400 border-slate-800 hover:text-white hover:bg-slate-900'
+                                }`}
+                                title="Toggle Focus Mode"
+                            >
+                                {focusMode ? '☼ FOCUS: ON' : '⛶ FOCUS'}
+                            </button>
+
+                            {/* Pause controls */}
+                            <button onClick={pauseGame} className="bg-slate-950/60 hover:bg-slate-900 border border-slate-850 p-2 rounded backdrop-blur-sm transition-all duration-200 shadow-md" title="Pause Game">
+                                <div className="space-x-1 flex select-none">
+                                    <div className="w-1 h-3 bg-yellow-500 rounded-sm"></div>
+                                    <div className="w-1 h-3 bg-yellow-500 rounded-sm"></div>
+                                </div>
+                            </button>
+                        </div>
                     </div>
                 </div>
                 
-                {/* --- JOYSTICK (ON PLAYER) --- */}
+                {/* Joystick overlay */}
                 <div 
                     ref={joystickContainerRef}
-                    className="absolute top-0 left-0 w-[100px] h-[100px] rounded-full bg-white/50 border-2 border-white/50 backdrop-blur-sm z-20 pointer-events-auto touch-none flex items-center justify-center transition-opacity duration-200 opacity-0"
+                    className="absolute top-0 left-0 w-[100px] h-[100px] rounded-full bg-slate-800/40 border-2 border-slate-500/50 backdrop-blur-sm z-20 pointer-events-auto touch-none flex items-center justify-center transition-opacity duration-200 opacity-0"
                     onPointerDown={handleJoystickStart}
                     onPointerMove={handleJoystickMove}
                     onPointerUp={handleJoystickEnd}
                     onPointerCancel={handleJoystickEnd}
                     onPointerLeave={handleJoystickEnd}
-                    style={{ transform: 'translate(-999px, -999px)' }} // Initial off-screen
+                    style={{ transform: 'translate(-999px, -999px)' }}
                 >
                     <div 
                         ref={joystickKnobRef}
-                        className="w-12 h-12 rounded-full bg-white shadow-lg pointer-events-none opacity-0 transition-transform duration-75 ease-linear"
+                        className="w-12 h-12 rounded-full bg-yellow-400 shadow-[0_0_12px_rgba(250,204,21,0.5)] pointer-events-none opacity-0 transition-transform duration-75 ease-linear"
                     ></div>
                 </div>
+
+                {/* Secure Heliox link Level briefing panel (Google AI Usage Category) */}
+                {gameState.activeBriefing !== '' && (
+                    <div className="absolute inset-0 bg-black/85 flex flex-col items-center justify-center z-[100] backdrop-blur-md p-4 text-amber-100 font-sans">
+                        <div className="w-full max-w-lg bg-[#0f0c08] border-2 border-amber-500/80 shadow-[0_0_35px_rgba(234,179,8,0.25)] p-6 rounded-lg flex flex-col relative">
+                            <div className="flex justify-between items-center border-b border-amber-500/25 pb-3 mb-4">
+                                <h2 className="text-sm font-black tracking-widest text-yellow-400 uppercase flex items-center gap-1.5">
+                                    <span>📡</span> DECRYPTION COMPLETE: HELIOS INTEL LINK
+                                </h2>
+                                <span className="text-[10px] font-mono bg-amber-950/60 text-yellow-400 px-2 py-0.5 rounded font-bold border border-amber-500/25 uppercase">LVL {gameState.currentLevel}</span>
+                            </div>
+                            <div className="min-h-[140px] flex flex-col justify-center mb-6">
+                                <p className="text-sm font-semibold text-amber-100/90 leading-relaxed break-words whitespace-pre-wrap font-sans">
+                                    {gameState.activeBriefing}
+                                </p>
+                            </div>
+                            <button 
+                                onClick={() => setGameState(prev => ({ ...prev, activeBriefing: '' }))}
+                                className="w-full py-3 bg-gradient-to-r from-amber-500 to-yellow-400 text-slate-950 font-black text-xs uppercase tracking-widest hover:brightness-105 active:scale-[0.99] transition-all rounded shadow-lg hover:shadow-[0_0_15px_rgba(234,179,8,0.4)]"
+                            >
+                                AUTHORIZE SYSTEM OVERRIDE
+                            </button>
+                        </div>
+                    </div>
+                )}
+
+                {/* Cryptographic Turing terminal popup hack window (Alan Turing Prize Category) */}
+                {hackingTerminal?.active && (
+                    <div className="absolute inset-0 bg-black/85 flex flex-col items-center justify-center z-[120] backdrop-blur-md p-4 text-amber-100 font-sans">
+                        <div className="w-full max-w-lg bg-[#0f0c08] border-2 border-amber-500/80 shadow-[0_0_35px_rgba(234,179,8,0.25)] p-6 rounded-lg relative flex flex-col select-text">
+                            
+                            <div className="text-yellow-400 font-mono text-xs font-bold uppercase mb-2 border-b border-amber-500/20 pb-2 flex justify-between items-center">
+                                <span className="font-extrabold">☀ KNOWLEDGE BOX DECRYPTED</span>
+                                {hackingTerminal.decrypting ? (
+                                    <span className="text-amber-400 animate-pulse">DECRYPTING MEMORY MODULE...</span>
+                                ) : (
+                                    <span className="text-yellow-400 font-black">DATA STREAM SECURED</span>
+                                )}
+                            </div>
+
+                            <div className="h-44 bg-amber-950/20 border border-amber-500/25 rounded p-4 overflow-y-auto mb-4 font-mono text-xs font-bold leading-normal text-yellow-300 select-text">
+                                {hackingTerminal.decrypting ? (
+                                    <div className="flex flex-col items-center justify-center h-full gap-3">
+                                        <div className="w-40 bg-amber-950/40 h-2.5 rounded overflow-hidden border border-amber-500/25 animate-pulse">
+                                            <div className="h-full bg-yellow-400 animate-pulse" style={{ width: '45%' }} />
+                                        </div>
+                                        <p className="text-[10px] animate-pulse text-amber-400">RECONSTRUCTING TURING TELEMETRY MEMORY...</p>
+                                    </div>
+                                ) : (
+                                    <div className="whitespace-pre-wrap select-text selection:bg-amber-900/50">
+                                        <p className="text-[10px] text-yellow-400 border-b border-amber-500/10 pb-1.5 mb-2 uppercase font-extrabold">ALAN TURING COMPILER SOURCE DATA:</p>
+                                        &quot;{hackingTerminal.quote}&quot;
+                                    </div>
+                                )}
+                            </div>
+
+                            <p className="text-[11px] text-amber-200/80 mb-4 font-sans font-semibold text-center leading-relaxed">
+                                Core consciousness data block localized. Recovering this segment will write +{(10 * Math.max(0.1, 1 - (selectedGameLevel - 1) * 0.1)).toFixed(1).replace('.0', '')}% ({Math.round(100 * Math.max(0.1, 1 - (selectedGameLevel - 1) * 0.1))} points) into Alex&apos;s primary awareness matrix.
+                            </p>
+
+                            <button 
+                                onClick={() => {
+                                    const mult = Math.max(0.1, 1 - (selectedGameLevel - 1) * 0.1);
+                                    const boxPoints = Math.round(100 * mult);
+                                    const boxPercent = 10 * mult;
+                                    playerRef.current.knowledge = Math.min(1000, playerRef.current.knowledge + boxPoints);
+                                    setPlayerStats(prev => ({ ...prev, knowledge: playerRef.current.knowledge }));
+                                    addFloatingMessage(`+${boxPercent % 1 === 0 ? boxPercent : boxPercent.toFixed(1)}%`, '#fbbf24', true);
+                                    setHackingTerminal(null);
+                                }}
+                                className={`py-2.5 w-full font-mono text-xs font-black uppercase text-slate-950 rounded tracking-widest transition-all ${hackingTerminal.decrypting ? 'bg-zinc-800 text-zinc-500 cursor-not-allowed' : 'bg-gradient-to-r from-amber-500 to-yellow-500 hover:brightness-105 hover:shadow-[0_0_12px_rgba(234,179,8,0.4)]'}`}
+                                disabled={hackingTerminal.decrypting}
+                            >
+                                ACCEPT & RE-COMPILE DATA LINK
+                            </button>
+                        </div>
+                    </div>
+                )}
                 </>
             ) : null}
 
-            {/* --- TUTORIAL OVERLAY --- */}
+            {/* --- TUTORIAL OVERLAY (REDESIGNED FOR DAYLIGHT DARK FEEL) --- */}
             {gameState.status === 'tutorial' && (
-                <div className="absolute inset-0 bg-black/80 flex flex-col items-center justify-center z-50 backdrop-blur-md p-4">
-                    <div className="w-full max-w-md bg-zinc-800 border-2 border-white/20 shadow-2xl overflow-hidden relative">
-                        <div className="bg-gradient-to-r from-red-900 to-black p-4 border-b border-white/10">
-                             <h2 className="text-2xl font-black italic text-white flex items-center gap-2">
+                <div className="absolute inset-0 bg-black/85 flex flex-col items-center justify-center z-50 backdrop-blur-md p-4 text-amber-100 font-sans">
+                    <div className="w-full max-w-md bg-[#0f0c08] border-2 border-amber-500/80 shadow-[0_0_30px_rgba(234,179,8,0.25)] rounded-lg overflow-hidden relative">
+                        {/* Header */}
+                        <div className="bg-amber-950/40 border-b border-amber-500/20 p-5">
+                             <h2 className="text-xl font-black text-yellow-400 flex items-center gap-2 tracking-wide uppercase">
                                 <span className="text-3xl">{TUTORIAL_SLIDES[tutorialStep].icon}</span>
                                 {TUTORIAL_SLIDES[tutorialStep].title}
                              </h2>
                         </div>
                         
-                        <div className="p-8 min-h-[250px] flex flex-col justify-center">
+                        {/* Body */}
+                        <div className="p-8 min-h-[220px] flex flex-col justify-center">
                             {TUTORIAL_SLIDES[tutorialStep].isPowerupSlide ? (
-                                <div className="grid grid-cols-2 gap-4">
-                                    <div className="flex items-center gap-2"><div className="w-4 h-4 bg-green-500"></div><span className="text-sm font-bold">MEDKIT</span></div>
-                                    <div className="flex items-center gap-2"><div className="w-4 h-4 bg-cyan-400 border border-cyan-200 rounded-full"></div><span className="text-sm font-bold">SHIELD</span></div>
-                                    <div className="flex items-center gap-2"><div className="w-0 h-0 border-l-[6px] border-r-[6px] border-b-[10px] border-transparent border-b-yellow-400"></div><span className="text-sm font-bold">SPEED</span></div>
-                                    <div className="flex items-center gap-2"><div className="w-4 h-3 rounded-full bg-purple-500"></div><span className="text-sm font-bold">STEALTH</span></div>
-                                    <p className="col-span-2 text-zinc-400 text-sm mt-4 italic">Collect supply crates to gain temporary advantages.</p>
+                                <div className="space-y-4">
+                                    <p className="text-xs font-mono font-bold tracking-widest text-amber-500 uppercase">✦ DETECTED SURVIVAL CRATES ✦</p>
+                                    <div className="grid grid-cols-2 gap-3.5 mt-2">
+                                        <div className="flex items-center gap-2.5 p-2 bg-[#221910] rounded border border-amber-500/20">
+                                            <div className="w-5 h-5 bg-green-500 rounded flex items-center justify-center font-bold text-white text-[10px] shadow-sm">🩹</div>
+                                            <span className="text-xs font-extrabold text-amber-100">MEDKIT</span>
+                                        </div>
+                                        <div className="flex items-center gap-2.5 p-2 bg-[#221910] rounded border border-amber-500/20">
+                                            <div className="w-5 h-5 bg-cyan-400 border border-cyan-200 rounded-full flex items-center justify-center text-white text-[10px] shadow-sm">🛡️</div>
+                                            <span className="text-xs font-extrabold text-amber-100">SHIELD</span>
+                                        </div>
+                                        <div className="flex items-center gap-2.5 p-2 bg-[#221910] rounded border border-amber-500/20">
+                                            <div className="w-5 h-5 bg-yellow-400 rounded flex items-center justify-center text-slate-900 text-[10px] shadow-sm font-mono font-black">⚡</div>
+                                            <span className="text-xs font-extrabold text-amber-100">SPEED BOOST</span>
+                                        </div>
+                                        <div className="flex items-center gap-2.5 p-2 bg-[#221910] rounded border border-amber-500/20">
+                                            <div className="w-5 h-5 rounded bg-purple-500 flex items-center justify-center text-white text-[10px] shadow-sm">👥</div>
+                                            <span className="text-xs font-extrabold text-amber-100">STEALTH CLOAK</span>
+                                        </div>
+                                    </div>
+                                    <p className="text-xs text-amber-300/70 italic mt-3">
+                                        Approaching crates grants instantaneous passive advantages and special capabilities.
+                                    </p>
                                 </div>
                             ) : (
-                                <p className="text-lg whitespace-pre-wrap leading-relaxed text-zinc-200">
+                                <p className="text-sm sm:text-base whitespace-pre-wrap leading-relaxed text-amber-100/90 font-semibold">
                                     {TUTORIAL_SLIDES[tutorialStep].content}
                                 </p>
                             )}
                         </div>
 
                         {/* Pagination Dots */}
-                        <div className="flex justify-center gap-2 mb-4">
+                        <div className="flex justify-center gap-2.5 mb-4">
                             {TUTORIAL_SLIDES.map((_, i) => (
-                                <div key={i} className={`w-2 h-2 rounded-full transition-colors ${i === tutorialStep ? 'bg-red-500' : 'bg-zinc-600'}`}></div>
+                                <div key={i} className={`w-2.5 h-2.5 rounded-full transition-colors ${i === tutorialStep ? 'bg-amber-400 shadow-[0_0_8px_rgba(234,179,8,0.8)]' : 'bg-slate-700'}`}></div>
                             ))}
                         </div>
 
-                        <div className="p-4 bg-black/40 border-t border-white/10 flex justify-between">
+                        {/* Footer Buttons */}
+                        <div className="p-4 bg-amber-950/20 border-t border-amber-500/10 flex justify-between">
                             <button 
                                 onClick={() => tutorialStep > 0 ? setTutorialStep(s => s-1) : finishTutorial()} 
-                                className="px-4 py-2 text-zinc-400 font-bold hover:text-white"
+                                className="px-4 py-2 text-amber-400 font-bold hover:text-yellow-300 transition-colors uppercase tracking-widest text-[10px] font-mono border border-amber-500/20 bg-amber-950/40 rounded"
                             >
                                 {tutorialStep === 0 ? 'SKIP' : 'BACK'}
                             </button>
@@ -1427,7 +2799,7 @@ export default function Game() {
                                     if(tutorialStep < TUTORIAL_SLIDES.length - 1) setTutorialStep(s => s+1);
                                     else finishTutorial();
                                 }} 
-                                className="px-6 py-2 bg-red-600 hover:bg-red-500 text-white font-black skew-x-[-10deg] transition-colors"
+                                className="px-6 py-2 bg-gradient-to-r from-amber-500 to-yellow-500 text-slate-950 font-black tracking-widest text-xs uppercase rounded transition-all shadow-md hover:translate-y-[-1px] hover:shadow-[0_0_15px_rgba(234,179,8,0.4)]"
                             >
                                 {tutorialStep === TUTORIAL_SLIDES.length - 1 ? 'START MISSION' : 'NEXT'}
                             </button>
@@ -1436,26 +2808,180 @@ export default function Game() {
                 </div>
             )}
 
+            {/* --- TUTORIAL POWERUP DETAILED EXPLANATION WINDOW (DAYLIGHT INFO BOXES) --- */}
+            {tutorialPowerupExplain && (
+                <div className="absolute inset-0 bg-black/85 flex flex-col items-center justify-center z-[130] backdrop-blur-md p-4 text-amber-100 font-sans">
+                    <div className="w-full max-w-sm bg-[#0f0c08] border-2 border-amber-500/80 shadow-[0_0_30px_rgba(234,179,8,0.25)] rounded-lg overflow-hidden relative transform scale-100 transition-all select-none">
+                        {/* Header */}
+                        <div className="bg-amber-950/40 border-b border-amber-500/20 p-4 shrink-0 flex items-center gap-3">
+                            <span className="text-3xl">
+                                {tutorialPowerupExplain.type === 'medkit' && '🩹'}
+                                {tutorialPowerupExplain.type === 'shield' && '🛡️'}
+                                {tutorialPowerupExplain.type === 'speed' && '⚡'}
+                                {tutorialPowerupExplain.type === 'stealth' && '👥'}
+                            </span>
+                            <div>
+                                <h2 className="text-[10px] font-mono font-bold uppercase tracking-wider text-amber-400 leading-none">SUBROUTINE DETECTED</h2>
+                                <h1 className="text-base font-black text-yellow-400 mt-1 leading-tight">{tutorialPowerupExplain.title}</h1>
+                            </div>
+                        </div>
+
+                        {/* Content area */}
+                        <div className="p-5">
+                            <span className="text-[9px] font-mono tracking-widest block font-black uppercase text-amber-500 mb-1.5">✦ COMPONENT OVERVIEW ✦</span>
+                            <p className="text-xs sm:text-sm font-semibold leading-relaxed text-amber-100/95 font-sans">
+                                {tutorialPowerupExplain.description}
+                            </p>
+                            
+                            <div className="mt-4 p-3 bg-amber-950/30 rounded border border-amber-500/25">
+                                <span className="text-[8px] font-mono tracking-widest block font-bold text-yellow-500 uppercase">TACTICAL APPLICATIONS &amp; USES:</span>
+                                <p className="text-xs text-amber-200 mt-1 font-semibold leading-relaxed font-sans">
+                                    {tutorialPowerupExplain.uses}
+                                </p>
+                            </div>
+                        </div>
+
+                        {/* Actions block */}
+                        <div className="p-4 bg-amber-950/20 border-t border-amber-500/10 flex justify-end">
+                            <button 
+                                onClick={() => setTutorialPowerupExplain(null)}
+                                className="px-5 py-2.5 bg-gradient-to-r from-amber-500 to-yellow-500 text-slate-950 font-black text-xs uppercase tracking-widest rounded transition-colors shadow hover:shadow-[0_0_12px_rgba(234,179,8,0.4)]"
+                            >
+                                UNDERSTOOD
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
             {/* --- MENUS --- */}
+            
+            {/* Levels Selection View */}
+            {gameState.status === 'levels' && (
+                <div className="absolute inset-0 bg-slate-950 flex flex-col z-50 overflow-hidden font-mono p-4 select-none">
+                    {/* Header */}
+                    <div className="p-4 bg-slate-900 border border-amber-500/20 rounded mb-6 flex justify-between items-center shrink-0">
+                        <div>
+                            <h2 className="text-3.5xl font-black text-yellow-400 tracking-tighter uppercase">MISSION RECON</h2>
+                            <p className="text-[10px] text-amber-500/70 tracking-widest uppercase">SELECT OPERATIONAL LEVEL FOR PENETRATION</p>
+                        </div>
+                        <button 
+                            onClick={() => setGameState(prev => ({ ...prev, status: 'menu' }))}
+                            className="px-4 py-2 border border-amber-500/30 text-amber-400 hover:bg-amber-950/30 text-xs font-black uppercase tracking-widest transition-all rounded cursor-pointer"
+                        >
+                            &larr; MAIN MENU
+                        </button>
+                    </div>
+
+                    {/* Levels scroll grid */}
+                    <div className="flex-1 overflow-y-auto pr-1 space-y-4 max-h-[72vh]">
+                        <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-4 pb-8">
+                            {Array.from({ length: unlockedLevels + 5 }).map((_, idx) => {
+                                const lvlNum = idx + 1;
+                                const isUnlocked = lvlNum <= unlockedLevels;
+                                const isCurrent = lvlNum === unlockedLevels;
+                                const achievedStars = levelStars[lvlNum] || 0;
+
+                                return (
+                                    <div
+                                        key={lvlNum}
+                                        onClick={() => {
+                                            if (isUnlocked) {
+                                                playSelectedLevel(lvlNum);
+                                            }
+                                        }}
+                                        className={`relative border-2 rounded-lg p-4 flex flex-col items-center justify-between transition-all h-36 border-amber-500/10 ${
+                                            isUnlocked 
+                                                ? 'bg-slate-900/60 hover:bg-slate-900 hover:border-amber-500/50 cursor-pointer group shadow-[0_0_15px_rgba(0,0,0,0.3)]' 
+                                                : 'bg-zinc-950/90 border-zinc-900 opacity-60 pointer-events-none'
+                                        }`}
+                                    >
+                                        {/* Box Tag/Icon */}
+                                        <div className="absolute top-2 right-2 text-[99px] leading-none select-none pointer-events-none opacity-5 tracking-tighter font-extrabold text-white absolute">
+                                            {lvlNum}
+                                        </div>
+                                        <div className="absolute top-2 right-2 text-[9px] font-bold z-10">
+                                            {isCurrent ? (
+                                                <span className="bg-amber-500/20 text-yellow-400 px-1.5 py-0.5 rounded border border-amber-500/30 uppercase tracking-widest animate-pulse">
+                                                    TARGET
+                                                </span>
+                                            ) : isUnlocked ? (
+                                                <span className="bg-emerald-500/10 text-emerald-400 px-1.5 py-0.5 rounded border border-emerald-500/20 uppercase tracking-widest">
+                                                    SECURED
+                                                </span>
+                                            ) : (
+                                                <span className="text-zinc-600">
+                                                    🔒
+                                                </span>
+                                            )}
+                                        </div>
+
+                                        {/* Level Name */}
+                                        <div className="my-auto text-center z-10">
+                                            <div className={`text-[10px] uppercase font-bold tracking-wider ${isUnlocked ? 'text-amber-500/60' : 'text-zinc-700'}`}>
+                                                SECTOR
+                                            </div>
+                                            <div className={`text-4xl font-extrabold ${isUnlocked ? 'text-white group-hover:scale-105 transition-transform' : 'text-zinc-800'}`}>
+                                                {lvlNum.toString().padStart(2, '0')}
+                                            </div>
+                                        </div>
+
+                                        {/* Level stars and action */}
+                                        <div className="w-full flex flex-col items-center gap-1 mt-auto z-10">
+                                            {/* Stars row */}
+                                            <div className="flex gap-1.5 justify-center">
+                                                {Array.from({ length: 3 }).map((_, starIdx) => {
+                                                    const starFilled = starIdx < achievedStars;
+                                                    return (
+                                                        <span 
+                                                            key={starIdx}
+                                                            className={`text-sm ${starFilled ? 'text-yellow-400 drop-shadow-[0_0_4px_rgba(234,179,8,0.5)]' : 'text-zinc-800'}`}
+                                                        >
+                                                            ★
+                                                        </span>
+                                                    );
+                                                })}
+                                            </div>
+                                            <div className="text-[8px] uppercase tracking-widest text-center mt-1">
+                                                {isCurrent ? (
+                                                    <span className="text-yellow-400 font-extrabold">DEPLOY FORCE</span>
+                                                ) : isUnlocked ? (
+                                                    <span className="text-zinc-400 group-hover:text-amber-400 transition-colors">REPLAY AREA</span>
+                                                ) : (
+                                                    <span className="text-zinc-800 font-black">ENCRYPTED</span>
+                                                )}
+                                            </div>
+                                        </div>
+                                    </div>
+                                );
+                            })}
+                        </div>
+                    </div>
+                </div>
+            )}
             
             {/* Main Menu */}
             {gameState.status === 'menu' && (
-                <div className="absolute inset-0 bg-zinc-900/90 flex flex-col items-center justify-center z-50">
-                    <div className={`${slantClass} bg-red-600 p-8 border-4 border-white mb-8 shadow-2xl shadow-red-500/20`}>
-                        <h1 className="transform skew-x-12 text-6xl font-black italic tracking-tighter text-white">
-                            HUNTER<br/><span className="text-black">ASSASSIN</span>
+                <div className="absolute inset-0 bg-zinc-950/95 flex flex-col items-center justify-center z-50">
+                    <div className={`${slantClass} bg-gradient-to-br from-amber-500 via-orange-500 to-yellow-500 p-6 border-4 border-white mb-8 shadow-2xl shadow-yellow-500/10`}>
+                        <h1 className="transform skew-x-12 text-5xl font-black italic tracking-tighter text-zinc-950 leading-none text-center uppercase">
+                            SOLSTICE<br/><span className="text-white text-6xl block mt-1 font-extrabold tracking-tight drop-shadow-md">ASSASSIN</span>
                         </h1>
                     </div>
-                    <div className="flex flex-col gap-4">
-                        <button onClick={startGame} className="group pointer-events-auto relative px-8 py-4 bg-transparent overflow-hidden border-2 border-white text-white font-black italic text-2xl hover:text-black transition-colors duration-300 w-64">
+                    <div className="flex flex-col gap-3.5">
+                        <button onClick={startGame} className="group pointer-events-auto relative px-8 py-3 bg-transparent overflow-hidden border-2 border-white text-white font-black italic text-xl hover:text-black transition-colors duration-300 w-64">
                             <div className="absolute inset-0 w-0 bg-white transition-all duration-[250ms] ease-out group-hover:w-full"></div>
                             <span className="relative">START MISSION</span>
                         </button>
-                        <button onClick={openShop} className="group pointer-events-auto relative px-8 py-4 bg-transparent overflow-hidden border-2 border-yellow-500 text-yellow-500 font-black italic text-2xl hover:text-black transition-colors duration-300 w-64">
+                        <button onClick={() => setShowStory(true)} className="group pointer-events-auto relative px-8 py-3 bg-transparent overflow-hidden border-2 border-orange-500 text-orange-400 font-black italic text-xl hover:text-zinc-950 transition-colors duration-300 w-64">
+                            <div className="absolute inset-0 w-0 bg-orange-500 transition-all duration-[250ms] ease-out group-hover:w-full"></div>
+                            <span className="relative">THE STORY LOGS</span>
+                        </button>
+                        <button onClick={openShop} className="group pointer-events-auto relative px-8 py-3 bg-transparent overflow-hidden border-2 border-yellow-500 text-yellow-500 font-black italic text-xl hover:text-black transition-colors duration-300 w-64">
                             <div className="absolute inset-0 w-0 bg-yellow-500 transition-all duration-[250ms] ease-out group-hover:w-full"></div>
                             <span className="relative">ARMORY SHOP</span>
                         </button>
-                        <button onClick={startTutorial} className="group pointer-events-auto relative px-8 py-2 bg-transparent overflow-hidden border border-zinc-500 text-zinc-400 font-bold text-sm hover:text-white transition-colors duration-300 w-64 mt-4">
+                        <button onClick={startTutorial} className="group pointer-events-auto relative px-8 py-2 bg-transparent overflow-hidden border border-zinc-500 text-zinc-400 font-bold text-sm hover:text-white transition-colors duration-300 w-64 mt-2">
                             <div className="absolute inset-0 w-0 bg-zinc-700 transition-all duration-[250ms] ease-out group-hover:w-full"></div>
                             <span className="relative">HOW TO PLAY</span>
                         </button>
@@ -1516,40 +3042,83 @@ export default function Game() {
                 </div>
             )}
 
-            {/* Victory Screen */}
-            {gameState.status === 'victory' && (
-                <div className="absolute inset-0 bg-green-900/90 flex flex-col items-center justify-center z-50 backdrop-blur-sm">
-                    <h2 className="text-6xl font-black italic text-white mb-2 drop-shadow-lg">MISSION CLEAR</h2>
-                    <div className="bg-black/40 p-6 rounded border border-white/10 mb-8 text-center w-64">
-                        <div className="flex justify-between mb-2">
-                             <span className="text-blue-400 font-bold">XP</span>
-                             <span className="text-white">+{XP_PER_LEVEL_COMPLETE}</span>
+            {/* Victory Appraisal Screen (Google AI Usage Category) */}
+            {gameState.status === 'victory' && !activeLevelResults && (
+                <div className="absolute inset-0 bg-slate-950/95 flex flex-col items-center justify-center z-50 backdrop-blur-md p-4">
+                    <span className="text-emerald-400 text-xs font-black tracking-[0.2em] mb-1 animate-pulse uppercase">SECTOR SECURED</span>
+                    <h2 className="text-[38px] sm:text-5xl font-black italic text-white tracking-tighter mb-4 uppercase text-center select-none">
+                        PHASE <span className="text-emerald-400">{gameState.currentLevel}</span> INFILTRATED
+                    </h2>
+                    
+                    {/* Gemini appraisal typewriter readout */}
+                    <div className="w-full max-w-lg bg-slate-900 border border-slate-800 rounded p-5 mb-5 font-mono text-xs leading-relaxed text-slate-300 relative select-text selection:bg-emerald-800">
+                        <div className="flex justify-between items-center text-[10px] text-slate-500 border-b border-slate-800 pb-2 mb-3 select-none">
+                            <span>▲ DYNAMICAL COGNIZANT DEBRIEF</span>
+                            <span className="text-yellow-500 font-bold">GEMINI CORES</span>
                         </div>
-                        <div className="flex justify-between mb-4">
-                             <span className="text-green-400 font-bold">CREDITS</span>
-                             <span className="text-white">+${CREDITS_PER_LEVEL_COMPLETE}</span>
+                        <div className="max-h-48 overflow-y-auto whitespace-pre-wrap font-bold select-text text-slate-300">
+                            {postMissionSummary ? postMissionSummary : "Gathering dynamic tactical analysis..."}
                         </div>
-                        <div className="w-full bg-zinc-700 h-1 mb-4"></div>
-                        <p className="text-zinc-400 text-sm">NEXT THREAT LEVEL</p>
-                        <p className="text-xl font-bold text-yellow-500">{(gameState.difficultyMultiplier + 0.1).toFixed(1)}x</p>
                     </div>
-                    <button onClick={nextLevel} className="pointer-events-auto px-10 py-4 bg-white text-green-900 font-black text-xl hover:scale-105 transition-transform skew-x-[-10deg]">
-                        NEXT OPERATION &rarr;
+
+                    <button 
+                        onClick={nextLevel} 
+                        className="pointer-events-auto px-10 py-3.5 bg-gradient-to-r from-emerald-500 to-teal-600 hover:brightness-110 active:scale-95 text-slate-950 font-black text-sm tracking-widest uppercase transition-all rounded shadow-lg shadow-emerald-950/50"
+                    >
+                        INITIATE NEXT PROTOCOL &rarr;
                     </button>
                 </div>
             )}
 
             {/* Game Over Screen */}
             {gameState.status === 'gameover' && (
-                <div className="absolute inset-0 bg-red-950/90 flex flex-col items-center justify-center z-50 backdrop-blur-sm">
-                    <h2 className="text-6xl font-black italic text-white mb-6 tracking-widest">K.I.A.</h2>
-                    <p className="text-red-400 font-bold mb-8">OPERATION FAILED</p>
-                    <div className="flex gap-4">
-                        <button onClick={retryLevel} className="pointer-events-auto px-8 py-3 border-2 border-white text-white font-bold hover:bg-white hover:text-red-900 transition">
-                            RETRY LEVEL
-                        </button>
-                        <button onClick={quitGame} className="pointer-events-auto px-8 py-3 bg-red-800 text-white font-bold hover:bg-red-700 transition">
-                            ABORT
+                <div className="absolute inset-0 bg-red-950/92 flex flex-col items-center justify-center z-50 backdrop-blur-md p-6">
+                    <h2 className="text-6xl font-black italic text-white mb-2 tracking-widest animate-pulse">K.I.A.</h2>
+                    <p className="text-red-400 font-black mb-2 uppercase tracking-widest text-[10px] font-mono">SOLSTICE PROTOCOL TERMINATED</p>
+                    
+                    <div className="bg-red-950/45 border border-red-900/40 rounded p-4 mb-8 text-center max-w-sm">
+                        {phaseRetries < 3 ? (
+                            <>
+                                <p className="text-amber-400 font-mono text-xs uppercase tracking-widest font-black mb-1">
+                                    ATTEMPT {phaseRetries + 1} / 4
+                                </p>
+                                <p className="text-[10px] text-slate-400 font-mono leading-normal">
+                                    Consciousness backup offline. Phase retries remaining: <span className="text-white font-bold">{3 - phaseRetries}</span>. Retrying will reset this Phase&apos;s recovered knowledge to 0%.
+                                </p>
+                            </>
+                        ) : (
+                            <>
+                                <p className="text-red-500 font-mono text-xs uppercase tracking-widest font-black mb-1 animate-pulse">
+                                    ATTEMPTS EXHAUSTED
+                                </p>
+                                <p className="text-[10px] text-red-300 font-mono leading-normal">
+                                    Data buffers corrupt. Connection lost. You must re-infiltrate this level from <span className="text-white font-bold">Phase 1</span>.
+                                </p>
+                            </>
+                        )}
+                    </div>
+
+                    <div className="flex flex-col sm:flex-row gap-4 items-center justify-center">
+                        {phaseRetries < 3 ? (
+                            <button 
+                                onClick={retryLevel} 
+                                className="pointer-events-auto px-8 py-3.5 bg-gradient-to-r from-amber-500 to-yellow-500 hover:brightness-110 active:scale-95 text-slate-950 font-black text-xs tracking-wider uppercase transition-all rounded shadow-lg shadow-amber-950/50"
+                            >
+                                RETRY PHASE ({3 - phaseRetries} LEFT)
+                            </button>
+                        ) : (
+                            <button 
+                                onClick={() => playSelectedLevel(selectedGameLevel)} 
+                                className="pointer-events-auto px-8 py-3.5 bg-gradient-to-r from-red-600 to-orange-600 hover:brightness-110 active:scale-95 text-white font-black text-xs tracking-wider uppercase transition-all rounded shadow-lg shadow-red-950/50 animate-pulse border border-red-400/30"
+                            >
+                                RESTART FROM PHASE 1
+                            </button>
+                        )}
+                        <button 
+                            onClick={quitGame} 
+                            className="pointer-events-auto px-8 py-3.5 bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-300 font-black text-xs tracking-wider uppercase transition-all rounded"
+                        >
+                            ABORT MISSION
                         </button>
                     </div>
                 </div>
@@ -1558,16 +3127,51 @@ export default function Game() {
             {/* Pause Menu */}
             {gameState.status === 'paused' && (
                 <div className="absolute inset-0 bg-black/60 backdrop-blur flex flex-col items-center justify-center z-50">
-                    <h2 className="text-4xl font-black italic text-white mb-8">SYSTEM PAUSED</h2>
+                    <h2 className="text-4xl font-black italic text-white mb-8 select-none">SYSTEM PAUSED</h2>
                     <div className="flex flex-col gap-4 w-48">
-                        <button onClick={pauseGame} className="pointer-events-auto py-3 bg-white text-black font-bold hover:translate-x-2 transition-transform skew-x-[-10deg]">
+                        <button onClick={pauseGame} className="pointer-events-auto py-3 bg-white text-slate-950 font-black hover:translate-x-2 transition-transform uppercase text-xs tracking-widest">
                             RESUME
                         </button>
-                        <button onClick={quitGame} className="pointer-events-auto py-3 bg-transparent border border-white text-white font-bold hover:translate-x-2 transition-transform skew-x-[-10deg]">
+                        <button onClick={quitGame} className="pointer-events-auto py-3 bg-transparent border border-white text-white font-black hover:translate-x-2 transition-transform uppercase text-xs tracking-widest">
                             QUIT TO MENU
                         </button>
                     </div>
                 </div>
+            )}
+
+            {/* System Shutdown Deletion Ending Screen */}
+            {gameState.status === 'deleted' && (
+                <DeletionOverlay
+                    currentLevel={gameState.currentLevel}
+                    credits={playerStats.credits}
+                    xp={playerStats.xp}
+                    onReset={startGame}
+                />
+            )}
+
+            {/* Level Results Overlay */}
+            {activeLevelResults && (
+                <LevelResultsOverlay
+                    levelNumber={activeLevelResults.levelNumber}
+                    stars={activeLevelResults.stars}
+                    knowledgePoints={activeLevelResults.knowledgePoints}
+                    credits={activeLevelResults.credits}
+                    xp={activeLevelResults.xp}
+                    isNewUnlock={activeLevelResults.isNewUnlock}
+                    onReplay={() => playSelectedLevel(activeLevelResults.levelNumber)}
+                    onContinue={() => {
+                        const nextLvl = activeLevelResults.levelNumber + 1;
+                        playSelectedLevel(nextLvl);
+                    }}
+                    onGoToMenu={() => {
+                        setActiveLevelResults(null);
+                        setGameState(prev => ({ ...prev, status: 'levels' }));
+                    }}
+                />
+            )}
+
+            {showStory && (
+                <StoryOverlay onClose={() => setShowStory(false)} />
             )}
         </div>
     );

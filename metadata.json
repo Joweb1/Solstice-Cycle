@@ -1,6 +1,8 @@
 {
-  "name": "Hunter Assassin: Tactical",
-  "description": "A tactical stealth game where you hunt targets while avoiding their line of sight. Enemies now retaliate with rapid-fire weaponry.",
+  "name": "Solstice Assassin",
+  "description": "An immersive tactical sci-fi stealth game based on the Summer Solstice. Eliminate cleaner NPCs, hack sector terminals, and unravel your true origin compiled by Turing before the final format cycle deletes your code.",
   "requestFramePermissions": [],
-  "majorCapabilities": []
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }

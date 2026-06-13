@@ -9,37 +9,37 @@ export const GRID_SIZE = 25;
 export const SKINS: Skin[] = [
     {
         id: 'default',
-        name: 'Recruit',
+        name: 'Dawn Seeker',
         cost: 0,
-        description: 'Standard issue gear.',
+        description: 'Standard issue environment suit optimized for dawn conditions.',
         colors: { body: '#4CAF50', helmet: '#2E7D32', visor: '#111', vest: '#388E3C' }
     },
     {
         id: 'midnight',
-        name: 'Night Ops',
+        name: 'Eclipse Operative',
         cost: 500,
-        description: 'Stealth gear for night raids.',
+        description: 'Pitch-black heat suppression armor designed for total eclipses.',
         colors: { body: '#263238', helmet: '#000000', visor: '#00E5FF', vest: '#37474F' }
     },
     {
         id: 'desert',
-        name: 'Sandstorm',
+        name: 'Solar Flare',
         cost: 1200,
-        description: 'Camouflage for arid environments.',
+        description: 'Hyper-reflective mesh for high noon desert assignments.',
         colors: { body: '#D7CCC8', helmet: '#8D6E63', visor: '#3E2723', vest: '#A1887F' }
     },
     {
         id: 'crimson',
-        name: 'Red Guard',
+        name: 'Solstice Champion',
         cost: 2500,
-        description: 'Elite assault armor.',
+        description: 'Elite crimson alloy optimized to absorb maximum sunset radiation.',
         colors: { body: '#B71C1C', helmet: '#7f0000', visor: '#FFD700', vest: '#D32F2F' }
     },
     {
         id: 'cyber',
-        name: 'Cybernetic',
+        name: 'Zenith Core',
         cost: 5000,
-        description: 'Enhanced robotics prototype.',
+        description: 'Experimental containment chassis powered by a direct sun mirror core.',
         colors: { body: '#E0E0E0', helmet: '#FFFFFF', visor: '#FF0055', vest: '#90A4AE' }
     }
 ];
@@ -59,6 +59,7 @@ export const INITIAL_PLAYER: Player = {
     xp: 0,
     level: 1,
     nextLevelXp: 1000,
+    knowledge: 0,
     credits: 0,
     unlockedSkins: ['default'],
     selectedSkin: 'default',

@@ -1,5 +1,5 @@
 import { CANVAS_WIDTH, CANVAS_HEIGHT, GRID_SIZE, BARREL_HP } from '../constants';
-import { Wall, Enemy, Point, LevelConfig, WallType, EnemyType, Decoration, Laser, Environment, TimeOfDay, Temperature, Powerup, PowerupType } from '../types';
+import { Wall, Enemy, Point, LevelConfig, WallType, EnemyType, Decoration, Laser, Environment, SolsticeModifier, SolsticePhase, Temperature, Powerup, PowerupType } from '../types';
 
 // Helper to get random int
 const rnd = (min: number, max: number) => Math.floor(Math.random() * (max - min + 1)) + min;
@@ -16,58 +16,79 @@ const checkOverlap = (x: number, y: number, w: number, h: number, items: {x:numb
 };
 
 const generateEnvironment = (level: number): Environment => {
-    // 1. Determine Time of Day
-    const cyclePos = level % 4;
-    let timeOfDay: TimeOfDay = 'day';
-    
-    // Weighted random for variety
-    const r = Math.random();
-    if (level === 1) timeOfDay = 'day';
-    else if (r > 0.8) timeOfDay = 'night';
-    else if (r > 0.6) timeOfDay = 'dusk';
-    else if (r > 0.4) timeOfDay = 'dawn';
-    else timeOfDay = 'day';
+    // Determine Solstice Modifier
+    let solsticeModifier: SolsticeModifier = 'Golden Dawn';
+    let solsticePhase: SolsticePhase = 'dawn';
 
-    // 2. Determine Temperature
-    let temperature: Temperature = 'normal';
-    const tR = Math.random();
-    if (tR > 0.7) temperature = 'hot';
-    else if (tR > 0.4) temperature = 'cold';
-
-    // 3. Set Colors based on combinations
-    let bgColor = '#202020'; // Default dark grey
-    let gridColor = '#2a2a2a';
-    let overlayColor = 'transparent';
-
-    // Temp affects base colors
-    if (temperature === 'hot') {
-        bgColor = '#3e2723'; // Dark brown
-        gridColor = '#4e342e';
-    } else if (temperature === 'cold') {
-        bgColor = '#263238'; // Blue grey
-        gridColor = '#37474f';
+    if (level === 1) {
+        solsticeModifier = 'Golden Dawn';
+        solsticePhase = 'dawn';
+    } else if (level === 2) {
+        solsticeModifier = 'High Noon';
+        solsticePhase = 'noon';
+    } else if (level === 3) {
+        solsticeModifier = 'Crimson Sunset';
+        solsticePhase = 'sunset';
+    } else {
+        const roll = Math.random();
+        if (roll > 0.75) {
+            solsticeModifier = 'Eclipse Event';
+            solsticePhase = 'night';
+        } else if (roll > 0.5) {
+            solsticeModifier = 'Crimson Sunset';
+            solsticePhase = 'sunset';
+        } else if (roll > 0.25) {
+            solsticeModifier = 'High Noon';
+            solsticePhase = 'noon';
+        } else {
+            solsticeModifier = 'Golden Dawn';
+            solsticePhase = 'dawn';
+        }
     }
 
-    // Time affects overlay
-    switch (timeOfDay) {
-        case 'night':
-            overlayColor = 'rgba(0, 10, 30, 0.6)';
+    // Determine Temperature
+    let temperature: Temperature = 'normal';
+    if (solsticeModifier === 'High Noon') {
+        temperature = 'hot';
+    } else if (solsticeModifier === 'Eclipse Event') {
+        temperature = 'cold';
+    } else {
+        const tR = Math.random();
+        if (tR > 0.7) temperature = 'hot';
+        else if (tR > 0.4) temperature = 'cold';
+    }
+
+    // Set Colors based on Solstice Modifier
+    let bgColor = '#18181a'; 
+    let gridColor = '#242429';
+    let overlayColor = 'transparent';
+
+    switch (solsticeModifier) {
+        case 'Golden Dawn':
+            bgColor = '#1e140d'; // Warm ochre
+            gridColor = '#2e1f14';
+            overlayColor = 'rgba(230, 115, 0, 0.12)';
             break;
-        case 'dusk':
-            overlayColor = 'rgba(74, 35, 90, 0.3)';
+        case 'High Noon':
+            bgColor = '#12181b'; // Blue slate sky
+            gridColor = '#1d272d';
+            overlayColor = 'rgba(255, 235, 59, 0.04)';
             break;
-        case 'dawn':
-            overlayColor = 'rgba(211, 84, 0, 0.2)';
+        case 'Crimson Sunset':
+            bgColor = '#0f0814'; // Crimson dark violet
+            gridColor = '#21132d';
+            overlayColor = 'rgba(156, 39, 176, 0.2)';
             break;
-        case 'day':
-        default:
-            overlayColor = 'rgba(0, 0, 0, 0)'; 
-            if (temperature === 'hot') overlayColor = 'rgba(255, 200, 0, 0.05)';
+        case 'Eclipse Event':
+            bgColor = '#030305'; // Absolute pitch black
+            gridColor = '#101015';
+            overlayColor = 'rgba(13, 0, 32, 0.55)';
             break;
     }
 
     return {
-        timeOfDay,
+        solsticePhase,
+        solsticeModifier,
         temperature,
         bgColor,
         gridColor,
@@ -76,16 +97,23 @@ const generateEnvironment = (level: number): Environment => {
 };
 
 export const generateLevel = (levelNumber: number, difficultyMult: number): LevelConfig => {
+    // Generate target environment
+    const environment = generateEnvironment(levelNumber);
+    const mod = environment.solsticeModifier;
+
     // Calculate density factor based on area
     const baseArea = 450 * 650;
     const currentArea = CANVAS_WIDTH * CANVAS_HEIGHT;
     const densityScale = Math.max(1, currentArea / baseArea);
 
-    const threatBudget = Math.floor((50 + (levelNumber * 10) * difficultyMult) * (densityScale * 0.8)); // Threat
+    // Scaling threat budget, eclipse events feature higher threat and rewards
+    let rawThreat = 50 + (levelNumber * 10) * difficultyMult;
+    if (mod === 'Eclipse Event') rawThreat *= 1.25;
+    const threatBudget = Math.floor(rawThreat * (densityScale * 0.8));
     
-    // Support Budget (Powerups)
-    // Base amount + random chance
-    const supportBudget = Math.floor(rnd(1, 3) + (levelNumber * 0.1));
+    // Support Budget (Powerups) - Reduced appearance as requested (only 45% chance to have powerups, max 1 or 2)
+    const hasPowerups = Math.random() < 0.45;
+    const supportBudget = hasPowerups ? Math.floor(rnd(1, 2)) : 0;
 
     // Scale object counts by density
     const obstacleCount = Math.floor(rnd(15, 25) * densityScale);
@@ -156,28 +184,52 @@ export const generateLevel = (levelNumber: number, difficultyMult: number): Leve
             // Keep within bounds
             if (x > 0 && x < CANVAS_WIDTH - w && y > 0 && y < CANVAS_HEIGHT - 50) {
                 if (!checkOverlap(x, y, w, h, [...walls, safetyZone])) {
-                    let type: WallType = 'crate';
-                    const roll = Math.random();
-                    let hp = undefined;
-                    
-                    if (roll > 0.9) type = 'treasure';
-                    else if (roll > 0.7) { 
-                        type = 'barrel'; 
-                        hp = BARREL_HP; 
-                    }
-                    else if (roll > 0.5) type = 'drum';
-                    else type = 'crate';
+                     let type: WallType = 'crate';
+                     const roll = Math.random();
+                     let hp = undefined;
+                     
+                     if (roll > 0.9) type = 'treasure';
+                     else if (roll > 0.7) { 
+                         type = 'barrel'; // Will become "Solar Cores" visually
+                         hp = BARREL_HP; 
+                     }
+                     else if (roll > 0.5) type = 'drum';
+                     else type = 'crate';
 
-                    walls.push({ id: wallIdCounter++, x, y, w, h, type, hp, maxHp: hp });
-                    placed = true;
+                     walls.push({ id: wallIdCounter++, x, y, w, h, type, hp, maxHp: hp });
+                     placed = true;
                 }
             }
             attempts++;
         }
     }
 
+    // 2.2 Add Encrypted Alan Turing Terminals (unlocked in levels)
+    const terminalCount = Math.min(3, rnd(1, 2) + (levelNumber % 2));
+    for (let i = 0; i < terminalCount; i++) {
+        let attempts = 0;
+        let placed = false;
+        while (attempts < 30 && !placed) {
+            const w = GRID_SIZE;
+            const h = GRID_SIZE;
+            // Spawn around middle sectors
+            const x = rnd(2, (CANVAS_WIDTH - 50)/GRID_SIZE) * GRID_SIZE;
+            const y = rnd(3, (CANVAS_HEIGHT - 180)/GRID_SIZE) * GRID_SIZE;
+
+            if (!checkOverlap(x, y, w, h, [...walls, safetyZone])) {
+                walls.push({
+                     id: wallIdCounter++,
+                     x, y, w, h,
+                     type: 'terminal',
+                     hacked: false
+                });
+                placed = true;
+            }
+            attempts++;
+        }
+    }
+
     // 3. Generate Powerups
-    // Prioritize open areas
     for (let i = 0; i < supportBudget; i++) {
         let attempts = 0;
         let placed = false;
@@ -190,14 +242,13 @@ export const generateLevel = (levelNumber: number, difficultyMult: number): Leve
                 const roll = Math.random();
                 let type: PowerupType = 'medkit';
                 
-                // Better powerups on higher levels or small chance
                 if (levelNumber > 2 && roll > 0.7) type = 'shield';
                 else if (levelNumber > 3 && roll > 0.5) type = 'stealth';
                 else if (roll > 0.3) type = 'speed';
 
                 powerups.push({
                     id: i,
-                    x: x + 12, // Center in tile roughly
+                    x: x + 12,
                     y: y + 12,
                     type,
                     active: true,
@@ -228,7 +279,7 @@ export const generateLevel = (levelNumber: number, difficultyMult: number): Leve
         });
     }
 
-    // 5. Generate Enemies
+    // 5. Generate Enemies with Solstice Traits
     let currentThreat = 0;
     let enemyId = 0;
     let fails = 0;
@@ -239,9 +290,17 @@ export const generateLevel = (levelNumber: number, difficultyMult: number): Leve
         // Pick enemy type
         let type: EnemyType = 'soldier';
         const r = Math.random();
-        if (difficultyMult > 1.5 && r > 0.85) type = 'heavy';
-        else if (difficultyMult > 1.2 && r > 0.7) type = 'sniper';
-        else if (r > 0.4) type = 'scout';
+        
+        // Under active Eclipse Event, heavy Eclipse Guardians (heavy) are much more common
+        if (mod === 'Eclipse Event') {
+            if (r > 0.6) type = 'heavy';
+            else if (r > 0.4) type = 'sniper';
+            else type = 'scout';
+        } else {
+            if (difficultyMult > 1.5 && r > 0.85) type = 'heavy';
+            else if (difficultyMult > 1.2 && r > 0.7) type = 'sniper';
+            else if (r > 0.4) type = 'scout';
+        }
 
         const cost = costs[type];
         if (currentThreat + cost > threatBudget) {
@@ -254,21 +313,20 @@ export const generateLevel = (levelNumber: number, difficultyMult: number): Leve
         let attempts = 0;
         while (!placed && attempts < 10) {
             const ex = rnd(50, CANVAS_WIDTH - 50);
-            const ey = rnd(50, CANVAS_HEIGHT - 200); // Keep away from immediate bottom spawn
+            const ey = rnd(50, CANVAS_HEIGHT - 200);
 
             if (checkOverlap(ex, ey, 30, 30, [...walls, safetyZone])) {
                 attempts++;
                 continue;
             }
 
-            // Generate Patrol
+            // Generate Patrol path
             const patrolPoints: Point[] = [];
             patrolPoints.push({x: ex, y: ey});
             const numPoints = rnd(2, 4);
             for(let p=0; p<numPoints; p++) {
                 let px = ex + rnd(-150, 150);
                 let py = ey + rnd(-150, 150);
-                // Simple bounds check
                 px = Math.max(50, Math.min(CANVAS_WIDTH-50, px));
                 py = Math.max(50, Math.min(CANVAS_HEIGHT-50, py));
                 if (!checkOverlap(px, py, 10, 10, walls)) {
@@ -276,17 +334,41 @@ export const generateLevel = (levelNumber: number, difficultyMult: number): Leve
                 }
             }
 
+            // Adapt Sensory stats based on the Solstice cycle
+            // Base ranges: scout=180, soldier=220, sniper=350
+            let baseRange = type === 'sniper' ? 350 : (type === 'scout' ? 180 : 220);
+            let baseFov = type === 'sniper' ? 0.8 : 1.2;
+            let baseSpeed = type === 'scout' ? 2.5 : (type === 'heavy' ? 1.0 : 1.8);
+
+            if (mod === 'High Noon') {
+                // Maximum solar brightness - wider and longer vision ranges
+                baseRange *= 1.35;
+                baseFov *= 1.15;
+            } else if (mod === 'Golden Dawn') {
+                // Low light, slow alert reaction speeds
+                baseRange *= 0.9;
+                baseSpeed *= 0.9;
+            } else if (mod === 'Crimson Sunset') {
+                // Creeping long shadows make concealment easy
+                baseRange *= 0.8;
+            } else if (mod === 'Eclipse Event') {
+                // Pitch dark solar eclipse. Enemies are blind unless extremely close!
+                baseRange *= 0.5; // Half sight range
+                baseFov *= 0.8;
+                baseSpeed *= 1.2; // Frantic quick patrols
+            }
+
             enemies.push({
                 id: enemyId++,
                 x: ex, y: ey,
                 angle: Math.random() * Math.PI * 2,
-                range: type === 'sniper' ? 350 : (type === 'scout' ? 180 : 220),
-                fov: type === 'sniper' ? 0.8 : 1.2,
+                range: baseRange,
+                fov: baseFov,
                 alive: true,
                 patrolPoints,
                 currentPatrolIdx: 0,
                 actualPath: [],
-                speed: type === 'scout' ? 2.5 : (type === 'heavy' ? 1.0 : 1.8),
+                speed: baseSpeed,
                 waitTime: 0,
                 state: 'init',
                 lastShotTime: 0,
@@ -309,6 +391,6 @@ export const generateLevel = (levelNumber: number, difficultyMult: number): Leve
         lasers,
         powerups,
         playerStart,
-        environment: generateEnvironment(levelNumber)
+        environment
     };
 };

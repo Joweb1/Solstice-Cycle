@@ -4,7 +4,7 @@ export interface Point {
     y: number;
 }
 
-export type WallType = 'crate' | 'container' | 'wall' | 'pillar' | 'drum' | 'treasure' | 'barrel';
+export type WallType = 'crate' | 'container' | 'wall' | 'pillar' | 'drum' | 'treasure' | 'barrel' | 'terminal';
 
 export interface Wall {
     id?: number; // Unique ID for identifying specific walls (like barrels)
@@ -16,6 +16,7 @@ export interface Wall {
     hp?: number;     // For destructible walls like barrels
     maxHp?: number;
     markedForDeletion?: boolean; // For cleanup after explosion
+    hacked?: boolean; // For encrypted terminals
 }
 
 export interface Decoration {
@@ -63,6 +64,7 @@ export interface Player {
     xp: number;
     level: number;
     nextLevelXp: number;
+    knowledge: number; // Knowledge score from 0 to 1000 representing Turing awareness
     // Economy & Cosmetics
     credits: number;
     unlockedSkins: string[]; // List of skin IDs
@@ -139,15 +141,20 @@ export interface GameState {
     currentLevel: number;
     enemiesRemaining: number;
     totalEnemies: number;
-    status: 'menu' | 'shop' | 'playing' | 'paused' | 'victory' | 'gameover' | 'tutorial';
+    status: 'menu' | 'shop' | 'playing' | 'paused' | 'victory' | 'gameover' | 'tutorial' | 'deleted';
     difficultyMultiplier: number; // 1.0 is standard
+    solsticeTimeProgress: number; // Ticks up during level (0 to 1, moving DAWN -> NIGHT)
+    activeBriefing?: string;
+    hackedTuringQuotes: string[];
 }
 
-export type TimeOfDay = 'day' | 'night' | 'dawn' | 'dusk';
+export type SolsticePhase = 'dawn' | 'morning' | 'noon' | 'afternoon' | 'sunset' | 'night';
+export type SolsticeModifier = 'Golden Dawn' | 'High Noon' | 'Crimson Sunset' | 'Eclipse Event';
 export type Temperature = 'normal' | 'hot' | 'cold';
 
 export interface Environment {
-    timeOfDay: TimeOfDay;
+    solsticePhase: SolsticePhase;
+    solsticeModifier: SolsticeModifier;
     temperature: Temperature;
     bgColor: string;      // Floor background color
     gridColor: string;    // Grid line color
