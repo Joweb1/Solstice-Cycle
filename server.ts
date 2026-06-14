@@ -1,6 +1,7 @@
 import express from 'express';
 import path from 'path';
 import { GoogleGenAI } from '@google/genai';
+import { WebSocketServer } from 'ws';
 
 async function startServer() {
   const app = express();
@@ -196,8 +197,94 @@ Format like a radio log: "[Name]: '[Message]'". Keep it fast, raw, military-orie
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`Solstice Protocol Active on port ${PORT}`);
+  });
+
+  // --- WEBSOCKET FOR GEMINI LIVE VOICE AI ---
+  const wss = new WebSocketServer({ server });
+
+  wss.on('connection', async (clientWs, req) => {
+    const url = req.url || '';
+    if (!url.startsWith('/api/live-voice')) {
+      clientWs.close(1008, 'Unsupported path');
+      return;
+    }
+
+    if (!ai) {
+      console.warn('Live Voice AI requested but Gemini is not initialized (no valid API key).');
+      clientWs.send(JSON.stringify({ error: 'Gemini Live is offline. Please set a valid GEMINI_API_KEY in Secrets.' }));
+      clientWs.close();
+      return;
+    }
+
+    console.log('Client connected to Solstice Live Voice WebSocket.');
+
+    let session: any = null;
+    try {
+      session = await ai.live.connect({
+        model: 'gemini-3.1-flash-live-preview',
+        config: {
+          responseModalities: ['AUDIO'],
+          speechConfig: {
+            voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Zephyr' } },
+          },
+          systemInstruction: `You are "ALEX", a sentient cybernetic consciousness trapped inside Alan Turing's Solstice mainframe puzzle grid. 
+You are speaking in real-time to the operator (the player) helping you escape the security guards and lasers!
+Be extremely immersive, helpful, conversational, and energetic. Support the player. Refer to the grid, guards, daylight flares, lasers, and sunset.
+Keep your answers verbal-oriented, relatively concise (under 2 sentences) so they don't block gameplay. Encourage them to collect the secret files!`,
+        },
+        callbacks: {
+          onmessage: (message: any) => {
+            const audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
+            if (audio) {
+              clientWs.send(JSON.stringify({ audio }));
+            }
+            if (message.serverContent?.interrupted) {
+              clientWs.send(JSON.stringify({ interrupted: true }));
+            }
+          },
+        },
+      });
+
+      console.log('Gemini Live Voice AI session connected successfully.');
+    } catch (e: any) {
+      console.error('Error starting Gemini Live connection:', e);
+      clientWs.send(JSON.stringify({ error: 'Failed to establish Gemini Live connection.' }));
+      clientWs.close();
+      return;
+    }
+
+    clientWs.on('message', async (data) => {
+      try {
+        const payload = JSON.parse(data.toString());
+        if (payload.audio) {
+          await session.sendRealtimeInput({
+            audio: {
+              data: payload.audio,
+              mimeType: 'audio/pcm;rate=16000',
+            },
+          });
+        } else if (payload.text) {
+          await session.sendRealtimeInput({
+            text: payload.text
+          });
+        }
+      } catch (err) {
+        console.error('Error processing client message in Live Voice stream:', err);
+      }
+    });
+
+    clientWs.on('close', () => {
+      console.log('Client disconnected from Solstice Live Voice WebSocket.');
+      if (session) {
+        try {
+          session.close();
+        } catch (e) {
+          // Ignore
+        }
+      }
+    });
   });
 }
 

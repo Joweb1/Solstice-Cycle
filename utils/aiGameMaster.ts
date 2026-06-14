@@ -229,6 +229,30 @@ export const generateLevel = (levelNumber: number, difficultyMult: number): Leve
         }
     }
 
+    // 2.3 Add Trapped AI Subroutines (one per level)
+    const aiCoreCount = levelNumber >= 2 ? 1 : 0;
+    for (let i = 0; i < aiCoreCount; i++) {
+        let attempts = 0;
+        let placed = false;
+        while (attempts < 30 && !placed) {
+            const w = GRID_SIZE;
+            const h = GRID_SIZE;
+            const x = rnd(2, (CANVAS_WIDTH - 50)/GRID_SIZE) * GRID_SIZE;
+            const y = rnd(3, (CANVAS_HEIGHT - 180)/GRID_SIZE) * GRID_SIZE;
+
+            if (!checkOverlap(x, y, w, h, [...walls, safetyZone])) {
+                walls.push({
+                     id: wallIdCounter++,
+                     x, y, w, h,
+                     type: 'ai_core',
+                     hacked: false
+                });
+                placed = true;
+            }
+            attempts++;
+        }
+    }
+
     // 3. Generate Powerups
     for (let i = 0; i < supportBudget; i++) {
         let attempts = 0;
@@ -382,6 +406,33 @@ export const generateLevel = (levelNumber: number, difficultyMult: number): Leve
             placed = true;
         }
         if(!placed) fails++;
+    }
+
+    // Generate security laser gates starting from level 2
+    if (levelNumber >= 2) {
+        const numLasers = Math.floor(rnd(2, 4));
+        for (let l = 0; l < numLasers; l++) {
+            const isHorizontal = Math.random() > 0.5;
+            if (isHorizontal) {
+                const y = Math.floor(rnd(150, CANVAS_HEIGHT - 250));
+                const w = Math.floor(rnd(100, 280));
+                const x = Math.floor(rnd(30, CANVAS_WIDTH - w - 30));
+                lasers.push({
+                    x, y, w, h: 4,
+                    active: true,
+                    axis: 'x'
+                });
+            } else {
+                const x = Math.floor(rnd(100, CANVAS_WIDTH - 100));
+                const h = Math.floor(rnd(100, 240));
+                const y = Math.floor(rnd(100, CANVAS_HEIGHT - h - 180));
+                lasers.push({
+                    x, y, w: 4, h,
+                    active: true,
+                    axis: 'y'
+                });
+            }
+        }
     }
 
     return {

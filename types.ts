@@ -4,7 +4,7 @@ export interface Point {
     y: number;
 }
 
-export type WallType = 'crate' | 'container' | 'wall' | 'pillar' | 'drum' | 'treasure' | 'barrel' | 'terminal';
+export type WallType = 'crate' | 'container' | 'wall' | 'pillar' | 'drum' | 'treasure' | 'barrel' | 'terminal' | 'ai_core';
 
 export interface Wall {
     id?: number; // Unique ID for identifying specific walls (like barrels)
